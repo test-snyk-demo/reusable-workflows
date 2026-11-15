@@ -4,8 +4,8 @@ name: JavaScript CI
 #   build (a package.json script) + Snyk Open Source + Code -> Docker build -> Snyk Container
 #
 # - build: false skips the build job (for apps with no build script).
-# - Snyk is report-only unless snyk-fail-on-issues is true, and is skipped with a warning when no
-#   snyk-token is passed. Results are published to Snyk (monitor) only on the default branch and
+# - Snyk is report-only unless snyk-fail-on-issues is true, and needs a snyk-token (the SNYK_TOKEN
+#   secret). Results are published to Snyk (monitor) only on the default branch and
 #   hotfix/* branches, or always with snyk-force-monitor.
 # - The Docker steps run when docker-build is true. The image is pushed (GHCR by default) only on
 #   the default branch and hotfix/*, or with docker-force-push; dry-run never pushes.
@@ -84,7 +84,7 @@ on:
     secrets:
       snyk-token:
         required: false
-        description: Snyk token. Without it the Snyk scans are skipped with a warning.
+        description: Snyk token (the SNYK_TOKEN secret).
     outputs:
       build-artifact-name:
         value: ${{ jobs.build.outputs.artifact-name }}
@@ -147,12 +147,7 @@ jobs:
     needs: [setup]
     uses: ./.github/workflows/js-snyk.yaml
     with:
-      runner-labels-json: ${{ inputs.runner-labels-json }}
       node-version: ${{ inputs.node-version }}
-      pnpm: ${{ inputs.pnpm }}
-      pnpm-version: ${{ inputs.pnpm-version }}
-      working-directory: ${{ inputs.working-directory }}
-      strict-lockfile: ${{ inputs.strict-lockfile }}
       fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
       severity-threshold: ${{ inputs.snyk-severity-threshold }}
       project-name: ${{ inputs.snyk-project-name }}

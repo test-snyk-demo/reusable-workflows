@@ -7,7 +7,7 @@ name: Go CI
 #   (monitor) only on the default branch and hotfix/* branches, or always with snyk-force-monitor.
 # - The Docker steps run when docker-build is true. The image is pushed (GHCR by default) only on
 #   the default branch and hotfix/*, or with docker-force-push; dry-run never pushes.
-# - No snyk-token: the Snyk scans are skipped with a warning and the rest still runs.
+# - Needs a snyk-token (the SNYK_TOKEN secret) for the Snyk scans.
 # - Private Go modules: go-private-owners + go-modules-token (or gh-app-id + gh-app-private-key).
 #
 # Caller job permissions: contents: read, actions: read, security-events: write,
@@ -82,7 +82,7 @@ on:
     secrets:
       snyk-token:
         required: false
-        description: Snyk token. Without it the Snyk scans are skipped with a warning.
+        description: Snyk token (the SNYK_TOKEN secret).
       go-modules-token:
         required: false
       gh-app-private-key:
