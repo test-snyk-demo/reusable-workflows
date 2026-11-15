@@ -1,7 +1,7 @@
 name: Docker Build
 
 # Builds the image, pushes it to GHCR (ghcr.io/<owner>/<image-name>) when asked, and saves it as a
-# tar artifact for docker-snyk-scan.yaml. Every image is tagged <branch>-<sha7>.
+# tar artifact for docker-snyk-scan.yaml. Every image is tagged with the short commit SHA.
 #
 # Caller job permissions: contents: read, and packages: write to push.
 
@@ -45,7 +45,7 @@ jobs:
     outputs:
       image-ref: ${{ steps.tag.outputs.image-ref }}
       build-tag: ${{ steps.tag.outputs.build-tag }}
-      image-digest: ${{ steps.push.outputs.digest }}
+      image-digest: ${{ inputs.push && steps.build.outputs.digest || '' }}
       image-artifact: ${{ steps.export.outputs.artifact }}
     steps:
       - uses: actions/checkout@v7
@@ -53,14 +53,10 @@ jobs:
       - name: Image tag
         id: tag
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name || github.event.repository.name }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
+          NAME: ${{ inputs.image-name || github.event.repository.name }}
         run: |
-          branch=$(tr '[:upper:]' '[:lower:]' <<<"$BRANCH" | sed -E 's/[^a-z0-9._-]+/-/g' | cut -c1-120)
-          tag="${branch}-${GITHUB_SHA::7}"
-          image=$(tr '[:upper:]' '[:lower:]' <<<"$IMAGE")
-          echo "build-tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "image-ref=$image:$tag" >> "$GITHUB_OUTPUT"
+          echo "build-tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image-ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${NAME,,}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         if: inputs.push
@@ -72,24 +68,17 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build
+      - name: Build (and push)
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
-          load: true
           tags: ${{ steps.tag.outputs.image-ref }}
+          load: true
+          push: ${{ inputs.push }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Push
-        id: push
-        if: inputs.push
-        env:
-          IMAGE_REF: ${{ steps.tag.outputs.image-ref }}
-        run: |
-          docker push "$IMAGE_REF"
-          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
 
       - name: Save image tar
         id: export
