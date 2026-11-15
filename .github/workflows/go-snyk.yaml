@@ -189,6 +189,14 @@ jobs:
           sarif_file: snyk-oss.sarif
           category: snyk-oss
 
+      # snyk code test --report (main) puts the project name in the run ID; without it (PRs) the ID is
+      # just Snyk/Code. Use one ID everywhere so code scanning can compare a PR with main.
+      - name: Same code scanning category on every branch
+        if: ${{ !cancelled() && hashFiles(format('{0}/snyk-code.sarif', inputs.working-directory)) != '' }}
+        run: |
+          jq '(.runs[]? | select(.automationDetails != null) | .automationDetails.id) = "Snyk/Code/"' snyk-code.sarif > snyk-code.fixed.sarif
+          mv snyk-code.fixed.sarif snyk-code.sarif
+
       - name: Upload Code SARIF
         if: ${{ !cancelled() && hashFiles('snyk-code.sarif') != '' }}
         continue-on-error: true
