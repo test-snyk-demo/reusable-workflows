@@ -172,7 +172,7 @@ jobs:
           [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
           [[ "$ALL_PROJECTS" == "true" ]] && args+=(--all-projects --detection-depth=1)
           rc=0
-          snyk test --sarif-file-output=snyk-oss.sarif --severity-threshold="$SEVERITY_THRESHOLD" "${args[@]}" || rc=$?
+          snyk test --sarif-file-output=snyk-oss.sarif --json-file-output=snyk-oss.json --severity-threshold="$SEVERITY_THRESHOLD" "${args[@]}" || rc=$?
           echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
           if [[ $rc -gt 1 ]]; then
             echo "::error title=Snyk Open Source scan failed::snyk test exited with $rc: a scan error, not a finding."
@@ -291,9 +291,12 @@ jobs:
             const query = encodeURIComponent(context.payload.pull_request
               ? `is:open pr:${pr}` : `is:open branch:${context.ref.replace('refs/heads/', '')}`);
             const securityTab = `${context.serverUrl}/${owner}/${repo}/security/code-scanning?query=${query}`;
+            // Snyk vulnerability IDs link to their page on security.snyk.io; the header links to the repo's projects in Snyk.
+            const snykLink = (id) => /^(SNYK-|npm:)/.test(id) ? `[${id}](https://security.snyk.io/vuln/${id})` : id;
+            const snykProjects = `https://app.snyk.io/org/${process.env.SNYK_ORG}/projects?searchQuery=${encodeURIComponent(repo)}`;
             const lines = [
               process.env.MARKER, `## ${process.env.TITLE}`, '',
-              `Showing \`${threshold}\` and above. All findings are in the [Security tab](${securityTab}).`, '',
+              `Showing \`${threshold}\` and above. All findings are in the [Security tab](${securityTab}) and [in Snyk](${snykProjects}).`, '',
               '| Scan | Findings |', '| --- | ---: |',
               ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} |`),
             ];
@@ -301,10 +304,46 @@ jobs:
               if (!s.found?.length) continue;
               lines.push('', `<details><summary><b>${s.label}</b> (${s.found.length})</summary>`, '');
               for (const f of s.found.slice(0, 20)) {
-                lines.push(`- \`${f.sev}\` ${f.rule}${f.file ? ` (\`${f.file}\`)` : ''}${f.text ? `: ${f.text}` : ''}`);
+                lines.push(`- \`${f.sev}\` ${snykLink(f.rule)}${f.file ? ` (\`${f.file}\`)` : ''}${f.text ? `: ${f.text}` : ''}`);
               }
               if (s.found.length > 20) lines.push(`- ...and ${s.found.length - 20} more`);
               lines.push('', '</details>');
+            }
+            // Fix paths from `snyk test --json`: which upgrade fixes how many issues.
+            try {
+              if (fs.existsSync('snyk-oss.json')) {
+                const data = JSON.parse(fs.readFileSync('snyk-oss.json', 'utf8'));
+                const ups = new Map();
+                let fixable = 0, total = 0;
+                for (const p of Array.isArray(data) ? data : [data]) {
+                  const ids = new Set((p.vulnerabilities || []).map((v) => v.id));
+                  total += ids.size;
+                  for (const [from, u] of Object.entries(p.remediation?.upgrade || {})) {
+                    const key = `${from} → ${String(u.upgradeTo).split('@').pop()}`;
+                    const set = ups.get(key) || new Set();
+                    for (const v of u.vulns || []) set.add(v);
+                    ups.set(key, set);
+                  }
+                }
+                const list = [...ups].map(([k, s]) => ({ k, n: s.size })).sort((a, b) => b.n - a.n);
+                fixable = new Set([...ups.values()].flatMap((s) => [...s])).size;
+                if (list.length) {
+                  lines.push('', `<details open><summary><b>Fix by upgrading</b>: ${list.length} upgrade${list.length > 1 ? 's' : ''} fix ${fixable} of ${total} Open Source issues</summary>`, '');
+                  for (const f of list.slice(0, 15)) lines.push(`- \`${f.k}\` fixes ${f.n} issue${f.n > 1 ? 's' : ''}`);
+                  if (list.length > 15) lines.push(`- ...and ${list.length - 15} more`);
+                  lines.push('', '</details>');
+                }
+              }
+            } catch (e) {
+              core.warning(`Unreadable snyk-oss.json: ${e.message}`);
+            }
+            // Fix PRs the Snyk app has opened on this repo.
+            try {
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              const snykPrs = open.filter((p) => /^snyk-(fix|upgrade)-/.test(p.head.ref));
+              if (snykPrs.length) lines.push('', `**Snyk fix PRs open:** ${snykPrs.map((p) => `#${p.number}`).join(', ')}`);
+            } catch (e) {
+              core.warning(`Could not list Snyk fix PRs: ${e.message}`);
             }
             const body = lines.join('\n');
             try {

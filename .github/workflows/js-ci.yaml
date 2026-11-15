@@ -129,7 +129,7 @@ jobs:
 
   build:
     name: Build
-    if: inputs.build
+    if: inputs.build && github.event_name != 'pull_request'  # PRs run the Snyk scan only
     uses: ./.github/workflows/js-build.yaml
     with:
       runner-labels-json: ${{ inputs.runner-labels-json }}

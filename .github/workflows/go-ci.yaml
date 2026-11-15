@@ -141,6 +141,7 @@ jobs:
           echo "release=$release" >> "$GITHUB_OUTPUT"
 
   lint:
+    if: github.event_name != 'pull_request'  # PRs run the Snyk scan only
     name: Lint
     uses: ./.github/workflows/go-lint.yaml
     with:
@@ -156,6 +157,7 @@ jobs:
       gh-app-private-key: ${{ secrets.gh-app-private-key }}
 
   test:
+    if: github.event_name != 'pull_request'  # PRs run the Snyk scan only
     name: Test ${{ matrix.identifier }}
     needs: [setup]
     strategy:
