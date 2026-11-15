@@ -192,7 +192,11 @@ jobs:
           args=("--remote-repo-url=$REMOTE_REPO_URL" "--target-reference=$TARGET_REFERENCE")
           [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
           [[ "$ALL_PROJECTS" == "true" ]] && args+=(--all-projects --detection-depth=1)
-          snyk monitor "${args[@]}"
+          rc=0
+          snyk monitor "${args[@]}" > snyk-monitor.out 2>&1 || rc=$?
+          cat snyk-monitor.out
+          echo "url=$(grep -o 'https://app.snyk.io/org/[^ ]*' snyk-monitor.out | head -1)" >> "$GITHUB_OUTPUT"
+          exit $rc
 
       # Snyk Code has no "critical" level, and needs --project-name with --report.
       - name: Snyk Code test
@@ -211,7 +215,9 @@ jobs:
           threshold="$SEVERITY_THRESHOLD"
           [[ "$threshold" == "critical" ]] && threshold=high
           rc=0
-          snyk code test --sarif-file-output=snyk-code.sarif --severity-threshold="$threshold" "${args[@]}" || rc=$?
+          snyk code test --sarif-file-output=snyk-code.sarif --severity-threshold="$threshold" "${args[@]}" > snyk-code.out 2>&1 || rc=$?
+          cat snyk-code.out
+          echo "url=$(grep -o 'https://app.snyk.io/org/[^ ]*' snyk-code.out | head -1)" >> "$GITHUB_OUTPUT"
           echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
           if [[ $rc -gt 1 ]]; then
             echo "::error title=Snyk Code scan failed::snyk code test exited with $rc: a scan error, not a finding (is Snyk Code enabled in the org? does the token's role have View Project Ignores?)."
@@ -242,58 +248,6 @@ jobs:
           sarif_file: ${{ inputs.working-directory }}/snyk-code.sarif
           category: snyk-code
 
-      # Finds this repo's Open Source and Code projects in Snyk for this run's branch (the PR branch on
-      # PRs, published above), else the default branch, so the comment links straight to them.
-      - name: Find Snyk projects
-        id: projects
-        if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.snyk-token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        shell: python3 {0}
-        run: |
-          import json, os, urllib.parse, urllib.request
-          api, ver = os.environ.get("SNYK_API", "https://api.snyk.io").rstrip("/"), "2024-10-15"
-          def get(path):
-              url = path if path.startswith("http") else api + (path if path.startswith("/rest") else "/rest" + path)
-              req = urllib.request.Request(url, headers={"Authorization": "token " + os.environ["SNYK_TOKEN"],
-                                                         "Accept": "application/vnd.api+json"})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.load(r)
-          slug, repo, out = os.environ["SNYK_ORG"], os.environ["REPO"].lower(), {}
-          orgs = get(f"/rest/orgs?version={ver}&slug={urllib.parse.quote(slug)}").get("data") or []
-          if orgs:
-              projects, path = [], f"/rest/orgs/{orgs[0]['id']}/projects?version={ver}&limit=100&expand=target"
-              for _ in range(20):
-                  page = get(path)
-                  projects += page.get("data") or []
-                  path = (page.get("links") or {}).get("next")
-                  if not path:
-                      break
-              def ours(p):  # by target: the CLI names projects after the manifest (e.g. "goof")
-                  t = ((p.get("relationships") or {}).get("target") or {}).get("data") or {}
-                  return str((t.get("attributes") or {}).get("display_name", "")).lower() == repo
-              refs = [os.environ["BRANCH"], os.environ.get("DEFAULT_BRANCH") or "main", None]
-              def pick(want):
-                  cands = sorted((p for p in projects if ours(p) and want(p["attributes"]["type"])),
-                                 key=lambda p: p["attributes"].get("origin") == "cli")  # Git integration first
-                  for ref in refs:
-                      for p in cands:
-                          if ref is None or p["attributes"].get("target_reference") == ref:
-                              return p
-              for key, want in (("oss", lambda t: t not in ("sast", "dockerfile", "deb", "apk", "rpm", "linux")),
-                                ("code", lambda t: t == "sast")):
-                  p = pick(want)
-                  if p:
-                      out[key] = f"https://app.snyk.io/org/{slug}/project/{p['id']}"
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              for k, v in out.items():
-                  f.write(f"{k}-url={v}\n")
-          print(out or "No matching Snyk projects found.")
-
       - name: Comment summary on PR
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
         uses: actions/github-script@v9
@@ -302,8 +256,8 @@ jobs:
           TITLE: Snyk scan
           THRESHOLD: ${{ inputs.severity-threshold }}
           SCANS: >-
-            [{"label": "Open Source", "url": "${{ steps.projects.outputs.oss-url }}", "file": "${{ inputs.working-directory }}/snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
-             {"label": "Code (SAST)", "url": "${{ steps.projects.outputs.code-url }}", "file": "${{ inputs.working-directory }}/snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
+            [{"label": "Open Source", "url": "${{ steps.snyk-monitor.outputs.url }}", "file": "${{ inputs.working-directory }}/snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
+             {"label": "Code (SAST)", "url": "${{ steps.snyk-code.outputs.url }}", "file": "${{ inputs.working-directory }}/snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
         with:
           script: |
             const fs = require('fs');
@@ -353,12 +307,11 @@ jobs:
             const query = encodeURIComponent(context.payload.pull_request
               ? `is:open pr:${pr}` : `is:open branch:${context.ref.replace('refs/heads/', '')}`);
             const securityTab = `${context.serverUrl}/${owner}/${repo}/security/code-scanning?query=${query}`;
-            // Snyk vulnerability IDs link to their page on security.snyk.io; the header links to the repo's projects in Snyk.
+            // Snyk vulnerability IDs link to their page on security.snyk.io.
             const snykLink = (id) => /^(SNYK-|npm:)/.test(id) ? `[${id}](https://security.snyk.io/vuln/${id})` : id;
-            const snykProjects = `https://app.snyk.io/org/${process.env.SNYK_ORG}/projects?searchQuery=${encodeURIComponent(repo)}`;
-            const lines = [
+                        const lines = [
               process.env.MARKER, `## ${process.env.TITLE}`, '',
-              `Showing \`${threshold}\` and above.${context.payload.pull_request ? '' : ` All findings are in the [Security tab](${securityTab}).`} Run: [${context.workflow} #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}).`, '',
+              `Showing \`${threshold}\` and above.${context.payload.pull_request ? '' : ` All findings are in the [Security tab](${securityTab}).`}${scans.some((s) => s.url) ? ` [View this run in Snyk](${scans.find((s) => s.url).url}).` : ''}`, '',
               '| Scan | Findings | Details |', '| --- | ---: | --- |',
               ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} | ${s.url ? `[See full details in Snyk →](${s.url})` : '—'} |`),
             ];
