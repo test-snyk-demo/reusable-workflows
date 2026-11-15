@@ -181,7 +181,9 @@ jobs:
 
       - name: Publish dependency snapshot to Snyk
         id: snyk-monitor
-        if: inputs.monitor && steps.token.outputs.present == 'true'
+        # Also on PRs and feat* branches: same Snyk target and project names as main, tagged with the
+        # branch (--target-reference), so the PR comment links to this run's results.
+        if: (inputs.monitor || github.event_name == 'pull_request' || startsWith(github.head_ref || github.ref_name, 'feat')) && steps.token.outputs.present == 'true'
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -199,7 +201,7 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.snyk-token }}
-          MONITOR: ${{ inputs.monitor }}
+          MONITOR: ${{ inputs.monitor || github.event_name == 'pull_request' || startsWith(github.head_ref || github.ref_name, 'feat') }}
         run: |
           args=()
           [[ -n "$SNYK_ORG" ]] && args+=("--org=$SNYK_ORG")
@@ -217,7 +219,7 @@ jobs:
           exit $rc
 
       - name: Upload Open Source SARIF
-        if: ${{ !cancelled() && hashFiles(format('{0}/snyk-oss.sarif', inputs.working-directory)) != '' }}
+        if: ${{ !cancelled() && hashFiles(format('{0}/snyk-oss.sarif', inputs.working-directory)) != '' && github.event_name != 'pull_request' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4
         with:
@@ -233,12 +235,64 @@ jobs:
           mv snyk-code.fixed.sarif snyk-code.sarif
 
       - name: Upload Code SARIF
-        if: ${{ !cancelled() && hashFiles(format('{0}/snyk-code.sarif', inputs.working-directory)) != '' }}
+        if: ${{ !cancelled() && hashFiles(format('{0}/snyk-code.sarif', inputs.working-directory)) != '' && github.event_name != 'pull_request' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ inputs.working-directory }}/snyk-code.sarif
           category: snyk-code
+
+      # Finds this repo's Open Source and Code projects in Snyk for this run's branch (the PR branch on
+      # PRs, published above), else the default branch, so the comment links straight to them.
+      - name: Find Snyk projects
+        id: projects
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: python3 {0}
+        run: |
+          import json, os, urllib.parse, urllib.request
+          api, ver = os.environ.get("SNYK_API", "https://api.snyk.io").rstrip("/"), "2024-10-15"
+          def get(path):
+              url = path if path.startswith("http") else api + (path if path.startswith("/rest") else "/rest" + path)
+              req = urllib.request.Request(url, headers={"Authorization": "token " + os.environ["SNYK_TOKEN"],
+                                                         "Accept": "application/vnd.api+json"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+          slug, repo, out = os.environ["SNYK_ORG"], os.environ["REPO"].lower(), {}
+          orgs = get(f"/rest/orgs?version={ver}&slug={urllib.parse.quote(slug)}").get("data") or []
+          if orgs:
+              projects, path = [], f"/rest/orgs/{orgs[0]['id']}/projects?version={ver}&limit=100&expand=target"
+              for _ in range(20):
+                  page = get(path)
+                  projects += page.get("data") or []
+                  path = (page.get("links") or {}).get("next")
+                  if not path:
+                      break
+              def ours(p):  # by target: the CLI names projects after the manifest (e.g. "goof")
+                  t = ((p.get("relationships") or {}).get("target") or {}).get("data") or {}
+                  return str((t.get("attributes") or {}).get("display_name", "")).lower() == repo
+              refs = [os.environ["BRANCH"], os.environ.get("DEFAULT_BRANCH") or "main", None]
+              def pick(want):
+                  cands = sorted((p for p in projects if ours(p) and want(p["attributes"]["type"])),
+                                 key=lambda p: p["attributes"].get("origin") == "cli")  # Git integration first
+                  for ref in refs:
+                      for p in cands:
+                          if ref is None or p["attributes"].get("target_reference") == ref:
+                              return p
+              for key, want in (("oss", lambda t: t not in ("sast", "dockerfile", "deb", "apk", "rpm", "linux")),
+                                ("code", lambda t: t == "sast")):
+                  p = pick(want)
+                  if p:
+                      out[key] = f"https://app.snyk.io/org/{slug}/project/{p['id']}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k, v in out.items():
+                  f.write(f"{k}-url={v}\n")
+          print(out or "No matching Snyk projects found.")
 
       - name: Comment summary on PR
         if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
@@ -248,8 +302,8 @@ jobs:
           TITLE: Snyk scan
           THRESHOLD: ${{ inputs.severity-threshold }}
           SCANS: >-
-            [{"label": "Open Source", "file": "${{ inputs.working-directory }}/snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
-             {"label": "Code (SAST)", "file": "${{ inputs.working-directory }}/snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
+            [{"label": "Open Source", "url": "${{ steps.projects.outputs.oss-url }}", "file": "${{ inputs.working-directory }}/snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
+             {"label": "Code (SAST)", "url": "${{ steps.projects.outputs.code-url }}", "file": "${{ inputs.working-directory }}/snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
         with:
           script: |
             const fs = require('fs');
@@ -304,9 +358,9 @@ jobs:
             const snykProjects = `https://app.snyk.io/org/${process.env.SNYK_ORG}/projects?searchQuery=${encodeURIComponent(repo)}`;
             const lines = [
               process.env.MARKER, `## ${process.env.TITLE}`, '',
-              `Showing \`${threshold}\` and above. All findings are in the [Security tab](${securityTab}) and [in Snyk](${snykProjects}).`, '',
-              '| Scan | Findings |', '| --- | ---: |',
-              ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} |`),
+              `Showing \`${threshold}\` and above.${context.payload.pull_request ? '' : ` All findings are in the [Security tab](${securityTab}).`} Run: [${context.workflow} #${context.runNumber}](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}).`, '',
+              '| Scan | Findings | Details |', '| --- | ---: | --- |',
+              ...scans.map((s) => `| ${s.label} | ${s.found === null ? ':warning: did not complete' : s.found.length} | ${s.url ? `[See full details in Snyk →](${s.url})` : '—'} |`),
             ];
             for (const s of scans) {
               if (!s.found?.length) continue;
