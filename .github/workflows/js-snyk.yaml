@@ -1,14 +1,17 @@
 name: JavaScript Snyk Scan
 
 # Reusable Snyk scan for an npm project at the repo root: Open Source (dependencies) and Code (SAST).
-# - Findings go to GitHub code scanning (SARIF) and one PR comment with links to this run in Snyk.
+# - Findings go to GitHub code scanning (SARIF) and one sticky PR comment (counts + up to 20 findings
+#   per scan, each linked to its code scanning alert).
 # - fail-on-issues turns on the quality gate (the callers set it on pull requests).
-# - Publishes to Snyk (`snyk monitor`, `snyk code test --report`) on PRs, feat* branches and, with
-#   monitor, the default branch, each under its branch name.
+# - monitor publishes to Snyk (`snyk monitor`, `snyk code test --report`): meant for the default
+#   branch and hotfix/* only. If publishing fails, the job fails.
 # - Needs the SNYK_TOKEN secret.
 #
 # Caller job permissions: contents: read, actions: read, security-events: write,
-# pull-requests: write. To publish Snyk Code results, the token's role also needs "View Project Ignores".
+# pull-requests: write. With monitor, the token's role also needs "View Project Ignores".
+#
+# Options marked "Not used in this demo" are commented out: uncomment them for repos that need them.
 
 on:
   workflow_call:
@@ -29,6 +32,25 @@ on:
         type: string
       snyk-org:
         type: string
+      # Not used in this demo: custom runners (e.g. self-hosted / larger instances).
+      # runner-labels-json:
+      #   type: string
+      #   default: '["ubuntu-24.04"]'
+      # Not used in this demo: pnpm instead of npm.
+      # pnpm:
+      #   type: boolean
+      #   default: false
+      # pnpm-version:
+      #   type: string
+      #   default: "10"
+      # Not used in this demo: project in a subfolder.
+      # working-directory:
+      #   type: string
+      #   default: .
+      # Not used in this demo: private npm registry login via GitHub OIDC (caller grants id-token: write).
+      # private-registry:
+      #   type: boolean
+      #   default: false
     secrets:
       snyk-token:
         required: false
@@ -38,11 +60,13 @@ permissions:
   actions: read
   security-events: write
   pull-requests: write
+  # id-token: write   # Not used in this demo: needed for the private-registry OIDC login.
 
 jobs:
   snyk:
     name: Snyk Scan
     runs-on: ubuntu-24.04
+    # runs-on: ${{ fromJson(inputs.runner-labels-json) }}   # Not used in this demo: custom runners.
     env:
       SNYK_TOKEN: ${{ secrets.snyk-token }}
       SNYK_ORG: ${{ inputs.snyk-org || github.repository_owner }}
@@ -50,7 +74,11 @@ jobs:
       PROJECT_NAME: ${{ inputs.project-name || github.repository }}
       REMOTE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
       TARGET_REFERENCE: ${{ github.head_ref || github.ref_name }}
-      PUBLISH: ${{ inputs.monitor || github.event_name == 'pull_request' || startsWith(github.head_ref || github.ref_name, 'feat') }}
+      MONITOR: ${{ inputs.monitor }}
+    # Not used in this demo: run everything from a subfolder.
+    # defaults:
+    #   run:
+    #     working-directory: ${{ inputs.working-directory }}
     steps:
       - uses: actions/checkout@v7
 
@@ -65,7 +93,23 @@ jobs:
             [tools]
             snyk = "1.1308.4"
 
+      # Not used in this demo: monorepos. Snyk itself supports them (--all-projects); this workflow
+      # assumes one app per repo, so it stops instead of scanning only the root package.
+      # - name: Check project layout
+      #   run: |
+      #     if node -e 'process.exit(require("./package.json").workspaces ? 0 : 1)'; then
+      #       echo "::error title=Snyk monorepo::package.json has workspaces. Monorepos aren't supported."
+      #       exit 1
+      #     fi
+
+      # Not used in this demo: private npm registry login via GitHub OIDC.
+      # - name: Log in to the private npm registry
+      #   if: inputs.private-registry
+      #   uses: <your-org>/<actions-repo>/.github/actions/npm-auth@v1
+
       - run: npm ci
+      # Not used in this demo: pnpm.
+      # - run: pnpm install --frozen-lockfile
 
       - name: Snyk Open Source test
         id: snyk-oss
@@ -78,26 +122,19 @@ jobs:
 
       - name: Publish dependency snapshot to Snyk
         id: snyk-monitor
-        if: env.PUBLISH == 'true'
+        if: inputs.monitor
         continue-on-error: true
-        run: |
-          rc=0
-          snyk monitor --org="$SNYK_ORG" --remote-repo-url="$REMOTE_REPO_URL" --target-reference="$TARGET_REFERENCE" > snyk-monitor.out 2>&1 || rc=$?
-          cat snyk-monitor.out
-          echo "url=$(grep -o 'https://app.snyk.io/org/[^ ]*' snyk-monitor.out | head -1)" >> "$GITHUB_OUTPUT"
-          exit $rc
+        run: snyk monitor --org="$SNYK_ORG" --remote-repo-url="$REMOTE_REPO_URL" --target-reference="$TARGET_REFERENCE"
 
-      - name: Snyk Code test
+      - name: Snyk Code test${{ inputs.monitor && ' and publish report' || '' }}
         id: snyk-code
         continue-on-error: true
         run: |
           args=(--org="$SNYK_ORG")
-          [[ "$PUBLISH" == "true" ]] && args+=(--report --remote-repo-url="$REMOTE_REPO_URL" --target-reference="$TARGET_REFERENCE" --project-name="$PROJECT_NAME")
+          [[ "$MONITOR" == "true" ]] && args+=(--report --remote-repo-url="$REMOTE_REPO_URL" --target-reference="$TARGET_REFERENCE" --project-name="$PROJECT_NAME")
           threshold="$SEVERITY_THRESHOLD"; [[ "$threshold" == "critical" ]] && threshold=high
           rc=0
-          snyk code test "${args[@]}" --severity-threshold="$threshold" --sarif-file-output=snyk-code.sarif > snyk-code.out 2>&1 || rc=$?
-          cat snyk-code.out
-          echo "url=$(grep -o 'https://app.snyk.io/org/[^ ]*' snyk-code.out | head -1)" >> "$GITHUB_OUTPUT"
+          snyk code test "${args[@]}" --severity-threshold="$threshold" --sarif-file-output=snyk-code.sarif || rc=$?
           echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
@@ -127,12 +164,12 @@ jobs:
         env:
           MARKER: "<!-- snyk-js-scan-summary -->"
           THRESHOLD: ${{ inputs.severity-threshold }}
-          SCANS: >-
-            [{"label": "Open Source", "url": "${{ steps.snyk-monitor.outputs.url }}", "file": "snyk-oss.sarif", "outcome": "${{ steps.snyk-oss.outcome }}"},
-             {"label": "Code (SAST)", "url": "${{ steps.snyk-code.outputs.url }}", "file": "snyk-code.sarif", "outcome": "${{ steps.snyk-code.outcome }}"}]
+          OSS_OUTCOME: ${{ steps.snyk-oss.outcome }}
+          CODE_OUTCOME: ${{ steps.snyk-code.outcome }}
         with:
           script: |
             const fs = require('fs');
+            const MAX = 20;
             const { owner, repo } = context.repo;
             let pr = context.payload.pull_request?.number;
             if (!pr) {
@@ -140,33 +177,69 @@ jobs:
               pr = data.find((p) => p.state === 'open')?.number;
             }
             if (!pr) return;
+
             const RANK = { low: 1, medium: 2, high: 3, critical: 4 };
+            const LEVEL = { error: 'high', warning: 'medium', note: 'low', none: 'low' };
             const threshold = process.env.THRESHOLD.toLowerCase();
             const floor = RANK[threshold] ?? 3;
-            const sev = (s) => (s >= 9 ? 4 : s >= 7 ? 3 : s >= 4 ? 2 : s > 0 ? 1 : 0);
-            const count = (file, outcome) => {
-              if (outcome === 'success') return 0;
+            const bucket = (s) => (s >= 9 ? 'critical' : s >= 7 ? 'high' : s >= 4 ? 'medium' : s > 0 ? 'low' : null);
+            const read = (file, outcome) => {
+              if (outcome === 'success') return [];
               if (!fs.existsSync(file)) return null;
-              let n = 0;
+              const out = [];
               for (const run of JSON.parse(fs.readFileSync(file, 'utf8')).runs || []) {
                 const rules = new Map((run.tool?.driver?.rules || []).map((r) => [r.id, r]));
                 for (const r of run.results || []) {
-                  const s = sev(parseFloat(rules.get(r.ruleId)?.properties?.['security-severity']));
-                  if (!s || s >= floor) n++;
+                  const rule = rules.get(r.ruleId);
+                  const scored = bucket(parseFloat(rule?.properties?.['security-severity']));
+                  if (scored && RANK[scored] < floor) continue;
+                  const loc = r.locations?.[0]?.physicalLocation;
+                  out.push({
+                    sev: scored ?? LEVEL[r.level ?? rule?.defaultConfiguration?.level ?? 'warning'],
+                    ruleId: r.ruleId || '', uri: loc?.artifactLocation?.uri || '', line: loc?.region?.startLine,
+                    text: (r.message?.text || '').split('\n')[0],
+                  });
                 }
               }
-              return n;
+              return out.sort((a, b) => RANK[b.sev] - RANK[a.sev]);
             };
-            const scans = JSON.parse(process.env.SCANS).map((s) => ({ ...s, n: count(s.file, s.outcome) }));
+            const scans = [
+              { label: 'Open Source', findings: read('snyk-oss.sarif', process.env.OSS_OUTCOME) },
+              { label: 'Code (SAST)', findings: read('snyk-code.sarif', process.env.CODE_OUTCOME) },
+            ];
+            const total = scans.reduce((n, s) => n + (s.findings?.length || 0), 0);
             const query = encodeURIComponent(context.payload.pull_request ? `is:open pr:${pr}` : `is:open branch:${context.ref.replace('refs/heads/', '')}`);
             const security = `${context.serverUrl}/${owner}/${repo}/security/code-scanning?query=${query}`;
-            const run = scans.find((s) => s.url)?.url;
-            const body = [
+
+            const alerts = new Map();
+            if (total > 0) {
+              try {
+                const list = await github.paginate(github.rest.codeScanning.listAlertsForRepo, { owner, repo, ref: context.ref, state: 'open', per_page: 100 });
+                for (const a of list) {
+                  const loc = a.most_recent_instance?.location;
+                  const key = `${a.rule?.id}|${loc?.path}`;
+                  alerts.set(`${key}|${loc?.start_line}`, a.html_url);
+                  alerts.set(key, alerts.has(key) ? null : a.html_url);
+                }
+              } catch (e) { core.warning(`Could not list code scanning alerts: ${e.message}`); }
+            }
+            const link = (f) => `[${f.ruleId}](${alerts.get(`${f.ruleId}|${f.uri}|${f.line}`) ?? alerts.get(`${f.ruleId}|${f.uri}`) ?? security})`;
+
+            const lines = [
               process.env.MARKER, '## Snyk scan', '',
-              `Showing \`${threshold}\` and above. ${[run ? `[View this run in Snyk](${run})` : '', `[GitHub Security tab](${security})`].filter(Boolean).join(' · ')}`, '',
-              '| Scan | Findings | Details |', '| --- | ---: | --- |',
-              ...scans.map((s) => `| ${s.label} | ${s.n === null ? ':warning: did not complete' : s.n} | ${s.url ? `[See full details in Snyk →](${s.url})` : '—'} |`),
-            ].join('\n');
+              `Showing \`${threshold}\` and above. Full findings in the [GitHub Security tab](${security}).`, '',
+              '| Scan | Findings |', '| --- | ---: |',
+              ...scans.map((s) => `| ${s.label} | ${s.findings === null ? ':warning: did not complete' : s.findings.length} |`),
+            ];
+            for (const s of scans) {
+              if (!s.findings?.length) continue;
+              lines.push('', `<details><summary><b>${s.label}</b> (${s.findings.length})</summary>`, '');
+              for (const f of s.findings.slice(0, MAX)) lines.push(`- \`${f.sev}\` ${link(f)}${f.uri ? ` (\`${f.uri}\`)` : ''}${f.text ? `: ${f.text}` : ''}`);
+              if (s.findings.length > MAX) lines.push(`- …and ${s.findings.length - MAX} more`);
+              lines.push('', '</details>');
+            }
+            if (total === 0 && scans.every((s) => s.findings !== null)) lines.push('', `No findings at or above \`${threshold}\`.`);
+            const body = lines.join('\n');
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr, per_page: 100 });
             const mine = comments.find((c) => c.body?.includes(process.env.MARKER));
             if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
