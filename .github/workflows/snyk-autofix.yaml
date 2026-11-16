@@ -135,7 +135,7 @@ jobs:
               const n = +m[2] + +m[3];
               if (m[1] === cur) curn = n; else if (n < bn) { best = m[1]; bn = n; }
             }
-            if (best && curn !== null && bn < curn) console.log(best, `${curn}->${bn}`);')
+            if (best && curn !== null && bn < curn) console.log(best, `${curn}->${bn}`);') || true
           echo "current=$current" >> "$GITHUB_OUTPUT"
           if [[ -n "$best" ]]; then
             sed -i "s|^FROM $current|FROM $best|I" "$DOCKERFILE"
