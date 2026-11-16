@@ -124,7 +124,7 @@ jobs:
 
       - name: Snyk Container base image recommendation
         id: base
-        if: inputs.dockerfile != ''
+        if: inputs.dockerfile != '' && hashFiles(inputs.dockerfile) != ''
         run: |
           current=$(grep -iE '^FROM ' "$DOCKERFILE" | tail -1 | awk '{print $2}')
           snyk container test "$current" --org="$SNYK_ORG" --file="$DOCKERFILE" --exclude-app-vulns > base.txt 2>&1 || true
@@ -150,8 +150,8 @@ jobs:
           count() { jq '[.vulnerabilities[]? | select(.severity == "critical" or .severity == "high") | .id] | unique | length' "$1"; }
           before=$(count before.json); after=$(count after.json)
           echo "before=$before" >> "$GITHUB_OUTPUT"; echo "after=$after" >> "$GITHUB_OUTPUT"
-          changed=$(git status --porcelain -- package.json package-lock.json ${DOCKERFILE:+"$DOCKERFILE"} | wc -l)
-          if (( changed > 0 )) && { (( after < before )) || [[ -n "${{ steps.base.outputs.image }}" ]]; }; then
+          changed=$(git status --porcelain -- package.json package-lock.json | wc -l)
+          if { (( changed > 0 )) && (( after < before )); } || [[ -n "${{ steps.base.outputs.image }}" ]]; then
             echo "open=true" >> "$GITHUB_OUTPUT"
           fi
           rm -f before.json after.json base.txt
@@ -188,7 +188,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$FIX_BRANCH"
-          git add package.json package-lock.json ${DOCKERFILE:+"$DOCKERFILE"}
+          files=(package.json package-lock.json); [[ -n "$DOCKERFILE" && -f "$DOCKERFILE" ]] && files+=("$DOCKERFILE")
+          git add "${files[@]}"
           git commit -qm "Snyk Autofix: apply Snyk's recommended upgrades for $PR_BRANCH"
           git push -f origin "$FIX_BRANCH"
           url=$(gh pr list --head "$FIX_BRANCH" --base "$PR_BRANCH" --state open --json url -q '.[0].url')
