@@ -3,7 +3,7 @@ name: Snyk Container Scan
 # Scans the image tar saved by docker-build.yaml. Findings go to the Security tab (SARIF) and the
 # run's summary page; monitor publishes a snapshot to Snyk and links it from the summary;
 # fail-on-issues turns on the quality gate (the job fails, so jobs that need it don't run).
-# Runs on pushes and manual runs only (not on pull requests).
+# Runs on the default branch (main) only; anywhere else the job is skipped.
 #
 # Caller job permissions: contents: read, actions: read, security-events: write.
 
@@ -42,6 +42,7 @@ permissions:
 jobs:
   snyk-container:
     name: Snyk Container Scan
+    if: github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
       SNYK_TOKEN: ${{ secrets.snyk-token }}

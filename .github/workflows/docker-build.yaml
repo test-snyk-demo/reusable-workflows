@@ -2,6 +2,7 @@ name: Docker Build
 
 # Builds the image, pushes it to GHCR (ghcr.io/<owner>/<image-name>) when asked, and saves it as a
 # tar artifact for docker-snyk-scan.yaml. Every image is tagged with the short commit SHA.
+# Runs on the default branch (main) only; anywhere else the job is skipped.
 #
 # Caller job permissions: contents: read, and packages: write to push.
 
@@ -41,6 +42,7 @@ permissions:
 jobs:
   build:
     name: Docker Build
+    if: github.ref_name == github.event.repository.default_branch && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     outputs:
       image-ref: ${{ steps.tag.outputs.image-ref }}
