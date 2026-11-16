@@ -1,21 +1,18 @@
 name: Snyk Autofix
 
-# Reusable, deterministic Snyk autofix for a pull request on an npm project.
-# On a PR, it applies Snyk's own recommendations to the PR's branch and opens a fix PR against it:
-# - Open Source: the upgrade Snyk recommends for each upgradable high/critical issue (upgradePath).
-#   Major-version upgrades are listed for review instead, unless allow-major is set.
-# - Container (optional, `dockerfile`): the base image Snyk recommends (baseImageRemediation),
-#   when it has fewer critical + high issues than the current one.
-# It re-scans and opens the fix PR only when the critical + high count goes down. No AI involved.
+# Reusable, deterministic Snyk autofix for a pull request on an npm project. It compares the PR branch
+# with its base branch and acts only on what the PR introduces, at or above severity-threshold:
+# - Open Source (SCA): applies the upgrade Snyk recommends (upgradePath) for each new upgradable issue
+#   and opens a fix PR against the PR's branch. Major-version upgrades are listed for review instead,
+#   unless allow-major is set. Optionally (`dockerfile`) the base image Snyk Container recommends.
+# No AI involved: everything comes from the Snyk CLI's output.
 #
-# Caller: on workflow_run (CI completed) for pull requests, skipping branches that start with
-# snyk-autofix/ (the fix PRs themselves). Also works on pull_request. A workflow_run caller only
-# triggers once it's on the default branch.
+# Caller: on workflow_run (CI completed) for pull requests, or on pull_request, skipping branches that
+# start with snyk-autofix/ (the fix PRs). A workflow_run caller only triggers once it's on the default branch.
 # Caller job permissions: contents: write, pull-requests: write.
 # Secrets: snyk-token. app-token is optional: a GitHub App token or PAT (contents + pull requests write).
-# Without it, GITHUB_TOKEN is used, and GitHub doesn't run CI on PRs it opens, so the fix PR isn't
-# scanned until someone pushes to it. GITHUB_TOKEN also needs the repo setting "Allow GitHub Actions
-# to create and approve pull requests".
+# Without it, GITHUB_TOKEN is used, GitHub doesn't run CI on PRs it opens, and the repo needs
+# "Allow GitHub Actions to create and approve pull requests".
 
 on:
   workflow_call:
@@ -46,7 +43,7 @@ permissions:
 
 jobs:
   autofix:
-    name: Snyk Autofix
+    name: Snyk Autofix for PR #${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
     runs-on: ubuntu-24.04
     env:
       SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -55,22 +52,36 @@ jobs:
       ALLOW_MAJOR: ${{ inputs.allow-major }}
       DOCKERFILE: ${{ inputs.dockerfile }}
       PR_BRANCH: ${{ github.head_ref || github.event.workflow_run.head_branch }}
+      BASE_BRANCH: ${{ github.base_ref || github.event.workflow_run.pull_requests[0].base.ref }}
       FIX_BRANCH: snyk-autofix/${{ github.head_ref || github.event.workflow_run.head_branch }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.event.workflow_run.head_repository.full_name }}
       GH_TOKEN: ${{ secrets.app-token || github.token }}
+    defaults:
+      run:
+        working-directory: head
     steps:
       - name: Only for pull requests from this repo
+        working-directory: .
         run: |
-          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" || -z "$PR_NUMBER" ]]; then
+          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" || -z "$PR_NUMBER" || -z "$BASE_BRANCH" ]]; then
             echo "::error title=Snyk Autofix::Runs only on open pull requests from branches in this repo."
             exit 1
           fi
 
-      - uses: actions/checkout@v7
+      - name: Check out the PR branch
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.head_ref || github.event.workflow_run.head_branch }}
           token: ${{ secrets.app-token || github.token }}
+          path: head
+
+      - name: Check out the base branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.base_ref || github.event.workflow_run.pull_requests[0].base.ref }}
+          path: base
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -82,36 +93,61 @@ jobs:
             [tools]
             snyk = "1.1308.4"
 
-      - name: Snyk test (before)
-        run: snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > before.json || true
-
-      - name: Read Snyk's upgrade recommendations
-        id: plan
+      - name: Snyk Open Source test, PR branch and base branch
+        working-directory: .
         run: |
-          node - <<'EOF' >> "$GITHUB_OUTPUT"
+          for side in head base; do
+            ( cd "$side" && snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > "../$side-oss.json" || true )
+          done
+          cat > "$RUNNER_TEMP/snyk-delta.js" <<'EOF'
+          // Compares Snyk results of the PR branch (head) with its base branch: only what the PR introduces.
           const fs = require('fs');
-          const d = JSON.parse(fs.readFileSync('before.json', 'utf8'));
-          const allowMajor = process.env.ALLOW_MAJOR === 'true';
-          const cmp = (a, b) => { const x = a.split(/[.-]/).map(Number), y = b.split(/[.-]/).map(Number);
-            for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); return 0; };
-          const at = (s) => { const i = s.lastIndexOf('@'); return [s.slice(0, i), s.slice(i + 1)]; };
-          const target = {}, current = {}, fixes = {};
-          for (const v of d.vulnerabilities || []) {
-            if (!v.isUpgradable || !v.upgradePath?.[1]) continue;
-            const [name, ver] = at(v.upgradePath[1]);
-            const [, from] = at(v.from[1]);
-            current[name] = from;
-            if (!target[name] || cmp(ver, target[name]) > 0) target[name] = ver;
-            (fixes[name] ??= new Set()).add(v.id);
+          const read = (f, empty) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return empty; } };
+          const SEV = new Set(['critical', 'high']);
+          const vulnKey = (v) => `${v.id}|${v.packageName}`;
+          const newVulns = (head, base) => {
+            const old = new Set((base.vulnerabilities || []).map(vulnKey));
+            return (head.vulnerabilities || []).filter((v) => SEV.has(v.severity) && !old.has(vulnKey(v)));
+          };
+          const mode = process.argv[2];
+
+          if (mode === 'count') {   // node snyk-delta.js count <head-oss.json> <base-oss.json>
+            console.log(new Set(newVulns(read(process.argv[3], {}), read(process.argv[4], {})).map(vulnKey)).size);
           }
-          const apply = [], review = [];
-          for (const [name, ver] of Object.entries(target)) {
-            const major = ver.split('.')[0] !== current[name].split('.')[0];
-            (major && !allowMajor ? review : apply).push(`${name}@${ver}|${current[name]}|${fixes[name].size}`);
+
+          if (mode === 'plan') {    // writes GITHUB_OUTPUT lines
+            const allowMajor = process.env.ALLOW_MAJOR === 'true';
+            const at = (s) => { const i = s.lastIndexOf('@'); return [s.slice(0, i), s.slice(i + 1)]; };
+            const cmp = (a, b) => { const x = a.split(/[.-]/).map(Number), y = b.split(/[.-]/).map(Number);
+              for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); return 0; };
+            const sca = newVulns(read('head-oss.json', {}), read('base-oss.json', {}));
+            // Per package: the highest same-major upgrade is applied; a major upgrade is listed for review.
+            const pkgs = {}, noFix = new Set();
+            for (const v of sca) {
+              if (!v.isUpgradable || !v.upgradePath?.[1]) { noFix.add(`${v.packageName}@${v.version}`); continue; }
+              const [name, ver] = at(v.upgradePath[1]);
+              const p = (pkgs[name] ??= { cur: at(v.from[1])[1], minor: null, major: null, nMinor: new Set(), nMajor: new Set() });
+              const kind = !allowMajor && ver.split('.')[0] !== p.cur.split('.')[0] ? 'major' : 'minor';
+              if (!p[kind] || cmp(ver, p[kind]) > 0) p[kind] = ver;
+              p[kind === 'major' ? 'nMajor' : 'nMinor'].add(v.id);
+            }
+            const apply = [], review = [];
+            for (const [name, p] of Object.entries(pkgs)) {
+              if (p.minor) apply.push(`${name}@${p.minor}|${p.cur}|${p.nMinor.size}`);
+              if (p.major) review.push(`${name}@${p.major}|${p.cur}|${p.nMajor.size}`);
+            }
+            console.log(`apply=${apply.join(' ')}`);
+            console.log(`review=${review.join(' ')}`);
+            console.log(`nofix=${[...noFix].join(' ')}`);
+            console.log(`sca_new=${new Set(sca.map(vulnKey)).size}`);
           }
-          console.log(`apply=${apply.join(' ')}`);
-          console.log(`review=${review.join(' ')}`);
           EOF
+
+      - name: Read Snyk's recommendations for what this PR introduces
+        id: plan
+        working-directory: .
+        run: |
+          node "$RUNNER_TEMP/snyk-delta.js" plan >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
       - name: Apply dependency upgrades
@@ -124,14 +160,14 @@ jobs:
 
       - name: Snyk Container base image recommendation
         id: base
-        if: inputs.dockerfile != ''
+        if: inputs.dockerfile != '' && hashFiles(format('head/{0}', inputs.dockerfile)) != ''
         run: |
           current=$(grep -iE '^FROM ' "$DOCKERFILE" | tail -1 | awk '{print $2}')
-          snyk container test "$current" --org="$SNYK_ORG" --file="$DOCKERFILE" --exclude-app-vulns > base.txt 2>&1 || true
-          sed -n '/^Testing /,/^Pro tip/p' base.txt | grep -vE '^\s*$' || cat base.txt
+          snyk container test "$current" --org="$SNYK_ORG" --file="$DOCKERFILE" --exclude-app-vulns > ../base.txt 2>&1 || true
+          sed -n '/^Testing /,/^Pro tip/p' ../base.txt | grep -vE '^\s*$' || cat ../base.txt
           read -r best ch < <(CUR="$current" node -e '
             const cur = process.env.CUR; let curn = null, best = null, bn = Infinity;
-            for (const l of require("fs").readFileSync("base.txt", "utf8").split("\n")) {
+            for (const l of require("fs").readFileSync("../base.txt", "utf8").split("\n")) {
               const m = l.match(/^(\S+:\S+)\s+\d+\s+(\d+) critical, (\d+) high/); if (!m) continue;
               const n = +m[2] + +m[3];
               if (m[1] === cur) curn = n; else if (n < bn) { best = m[1]; bn = n; }
@@ -143,18 +179,19 @@ jobs:
             echo "image=$best" >> "$GITHUB_OUTPUT"; echo "change=$ch" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Snyk test (after)
+      - name: Snyk test (after the upgrades)
         id: verify
+        if: steps.plan.outputs.apply != '' || steps.base.outputs.image != ''
+        env:
+          BEFORE: ${{ steps.plan.outputs.sca_new }}
         run: |
-          snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > after.json || true
-          count() { jq '[.vulnerabilities[]? | select(.severity == "critical" or .severity == "high") | .id] | unique | length' "$1"; }
-          before=$(count before.json); after=$(count after.json)
-          echo "before=$before" >> "$GITHUB_OUTPUT"; echo "after=$after" >> "$GITHUB_OUTPUT"
-          changed=$(git status --porcelain -- package.json package-lock.json ${DOCKERFILE:+"$DOCKERFILE"} | wc -l)
-          if (( changed > 0 )) && { (( after < before )) || [[ -n "${{ steps.base.outputs.image }}" ]]; }; then
+          snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > ../after-oss.json || true
+          after=$(node "$RUNNER_TEMP/snyk-delta.js" count ../after-oss.json ../base-oss.json)
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+          changed=$(git status --porcelain -- package.json package-lock.json | wc -l)
+          if { (( changed > 0 )) && (( after < BEFORE )); } || [[ -n "${{ steps.base.outputs.image }}" ]]; then
             echo "open=true" >> "$GITHUB_OUTPUT"
           fi
-          rm -f before.json after.json base.txt
 
       - name: Open or update the fix PR
         id: pr
@@ -162,16 +199,16 @@ jobs:
         env:
           APPLY: ${{ steps.plan.outputs.apply }}
           REVIEW: ${{ steps.plan.outputs.review }}
-          BEFORE: ${{ steps.verify.outputs.before }}
+          BEFORE: ${{ steps.plan.outputs.sca_new }}
           AFTER: ${{ steps.verify.outputs.after }}
           BASE_FROM: ${{ steps.base.outputs.current }}
           BASE_TO: ${{ steps.base.outputs.image }}
           BASE_CHANGE: ${{ steps.base.outputs.change }}
         run: |
           {
-            echo "Applies **Snyk's recommendations** to \`$PR_BRANCH\` (#$PR_NUMBER). Merge it into that branch."
+            echo "Applies **Snyk's recommendations** for the dependency issues that \`$PR_BRANCH\` (#$PR_NUMBER) introduces. Merge it into that branch."
             echo
-            echo "**Open Source, high and critical:** $BEFORE → $AFTER"
+            echo "**New high/critical Open Source issues in #$PR_NUMBER:** $BEFORE → $AFTER"
             if [[ -n "$APPLY" ]]; then
               echo; echo "| Package | From | To | Snyk issues fixed |"; echo "|---|---|---|---|"
               for a in $APPLY; do IFS='|' read -r to from n <<< "$a"; echo "| \`${to%@*}\` | $from | ${to##*@} | $n |"; done
@@ -183,34 +220,45 @@ jobs:
               echo; echo "**Needs review (major version, not applied):**"
               for a in $REVIEW; do IFS='|' read -r to from n <<< "$a"; echo "- \`${to%@*}\` $from → ${to##*@} ($n issues)"; done
             fi
-            echo; echo "_Generated by Snyk Autofix from \`snyk test\` on ${GITHUB_SHA::7}: [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
-          } > body.md
+            echo; echo "_Generated by Snyk Autofix from \`snyk test\`: [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
+          } > ../body.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$FIX_BRANCH"
-          git add package.json package-lock.json ${DOCKERFILE:+"$DOCKERFILE"}
-          git commit -qm "Snyk Autofix: apply Snyk's recommended upgrades for $PR_BRANCH"
+          files=(package.json package-lock.json); [[ -n "$DOCKERFILE" && -f "$DOCKERFILE" ]] && files+=("$DOCKERFILE")
+          git add "${files[@]}"
+          git commit -qm "Snyk Autofix: Snyk's recommended upgrades for the issues $PR_BRANCH introduces"
           git push -f origin "$FIX_BRANCH"
           url=$(gh pr list --head "$FIX_BRANCH" --base "$PR_BRANCH" --state open --json url -q '.[0].url')
-          if [[ -n "$url" ]]; then gh pr edit "$url" --body-file body.md
-          else url=$(gh pr create --head "$FIX_BRANCH" --base "$PR_BRANCH" --title "Snyk Autofix for #$PR_NUMBER: high/critical $BEFORE → $AFTER" --body-file body.md); fi
+          if [[ -n "$url" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/${url##*/}" -F body=@../body.md >/dev/null
+          else url=$(gh pr create --head "$FIX_BRANCH" --base "$PR_BRANCH" --title "Snyk Autofix for #$PR_NUMBER: new high/critical $BEFORE → $AFTER" --body-file ../body.md); fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Comment on the PR
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
         env:
           URL: ${{ steps.pr.outputs.url }}
-          BEFORE: ${{ steps.verify.outputs.before }}
+          SCA_NEW: ${{ steps.plan.outputs.sca_new }}
           AFTER: ${{ steps.verify.outputs.after }}
           REVIEW: ${{ steps.plan.outputs.review }}
+          NOFIX: ${{ steps.plan.outputs.nofix }}
         run: |
           marker="<!-- snyk-autofix -->"
-          if [[ -n "$URL" ]]; then msg="**Snyk Autofix:** high/critical $BEFORE → $AFTER with Snyk's recommended upgrades. Fix PR: $URL"
-          elif [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do names+="${a%%|*} "; done
-            msg="**Snyk Autofix:** the remaining upgrades are major versions, so they need a human: ${names% }"
-          else msg="**Snyk Autofix:** nothing to apply. No upgradable high/critical issues on this branch."; fi
-          printf '%s\n%s\n' "$marker" "$msg" > comment.md
+          {
+            echo "$marker"
+            echo "## Snyk Autofix"
+            echo "_What this PR introduces compared with \`$BASE_BRANCH\`, at \`$THRESHOLD\` and above._"
+            echo
+            echo "**New Open Source (dependency) issues: $SCA_NEW**"
+            if [[ -n "$URL" ]]; then echo "✅ Snyk's recommended upgrades are in **$URL** (new issues $SCA_NEW → $AFTER). Merge it into this branch."
+            elif (( SCA_NEW == 0 )); then echo "✅ No new dependency issues."
+            else echo "No upgrade from Snyk could fix these automatically."; fi
+            if [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do names+="\`${a%%|*}\` "; done; echo; echo "Major-version upgrades for you to review: $names"; fi
+            if [[ -n "$NOFIX" ]]; then echo; echo "No fix available yet from Snyk: \`${NOFIX// /\`, \`}\`"; fi
+            echo
+            echo "_[Snyk Autofix run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
+          } > ../comment.md
           id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
-          if [[ -n "$id" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md >/dev/null
-          else gh pr comment "$PR_NUMBER" --body-file comment.md; fi
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$id" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@../comment.md >/dev/null
+          else gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@../comment.md >/dev/null; fi
+          cat ../comment.md >> "$GITHUB_STEP_SUMMARY"
