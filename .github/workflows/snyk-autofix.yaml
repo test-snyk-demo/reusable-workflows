@@ -150,13 +150,35 @@ jobs:
           node "$RUNNER_TEMP/snyk-delta.js" plan >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
+      # Repeats up to 3 rounds: an upgrade can land on a version with its own, newer issue, which Snyk
+      # then fixes with a further upgrade (e.g. axios 0.21.1 -> 0.32.0 -> 0.34.0).
       - name: Apply dependency upgrades
+        id: apply
         if: steps.plan.outputs.apply != ''
-        env:
-          APPLY: ${{ steps.plan.outputs.apply }}
         run: |
-          pkgs=(); for a in $APPLY; do pkgs+=("${a%%|*}"); done
-          npm install --ignore-scripts --no-audit --no-fund "${pkgs[@]}"
+          declare -A from count; order=(); prev=""
+          for round in 1 2 3; do
+            plan=$(cd .. && node "$RUNNER_TEMP/snyk-delta.js" plan)
+            apply=$(sed -n 's/^apply=//p' <<< "$plan")
+            review=$(sed -n 's/^review=//p' <<< "$plan"); nofix=$(sed -n 's/^nofix=//p' <<< "$plan")
+            [[ -z "$apply" || "$apply" == "$prev" ]] && break
+            prev="$apply"; pkgs=()
+            for a in $apply; do
+              IFS='|' read -r to cur n <<< "$a"; name="${to%@*}"; pkgs+=("$to")
+              [[ -z "${from[$name]:-}" ]] && { from[$name]="$cur"; order+=("$name"); }
+              count[$name]=$(( ${count[$name]:-0} + n ))
+            done
+            echo "::group::Round $round: ${pkgs[*]}"
+            npm install --ignore-scripts --no-audit --no-fund "${pkgs[@]}"
+            echo "::endgroup::"
+            snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > ../head-oss.json || true
+          done
+          applied=""
+          for name in "${order[@]}"; do
+            to=$(node -p "require('./package-lock.json').packages['node_modules/$name'].version")
+            applied+="$name@$to|${from[$name]}|${count[$name]} "
+          done
+          { echo "applied=${applied% }"; echo "review=$review"; echo "nofix=$nofix"; } | tee -a "$GITHUB_OUTPUT"
 
       - name: Snyk Container base image recommendation
         id: base
@@ -197,8 +219,8 @@ jobs:
         id: pr
         if: steps.verify.outputs.open == 'true'
         env:
-          APPLY: ${{ steps.plan.outputs.apply }}
-          REVIEW: ${{ steps.plan.outputs.review }}
+          APPLY: ${{ steps.apply.outputs.applied }}
+          REVIEW: ${{ steps.apply.outputs.review }}
           BEFORE: ${{ steps.plan.outputs.sca_new }}
           AFTER: ${{ steps.verify.outputs.after }}
           BASE_FROM: ${{ steps.base.outputs.current }}
@@ -240,10 +262,15 @@ jobs:
           URL: ${{ steps.pr.outputs.url }}
           SCA_NEW: ${{ steps.plan.outputs.sca_new }}
           AFTER: ${{ steps.verify.outputs.after }}
-          REVIEW: ${{ steps.plan.outputs.review }}
-          NOFIX: ${{ steps.plan.outputs.nofix }}
+          APPLY_RAN: ${{ steps.apply.outcome }}
+          REVIEW_PLAN: ${{ steps.plan.outputs.review }}
+          NOFIX_PLAN: ${{ steps.plan.outputs.nofix }}
+          REVIEW_APPLY: ${{ steps.apply.outputs.review }}
+          NOFIX_APPLY: ${{ steps.apply.outputs.nofix }}
         run: |
           marker="<!-- snyk-autofix -->"
+          # After the upgrade rounds, what's left to review / unfixable comes from the last round.
+          if [[ "$APPLY_RAN" == "success" ]]; then REVIEW="$REVIEW_APPLY"; NOFIX="$NOFIX_APPLY"; else REVIEW="$REVIEW_PLAN"; NOFIX="$NOFIX_PLAN"; fi
           id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
           # Nothing new: stay quiet. Only an earlier Snyk Autofix comment is updated, so it isn't left stale.
           if (( SCA_NEW == 0 )); then
