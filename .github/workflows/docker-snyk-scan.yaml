@@ -1,7 +1,8 @@
 name: Snyk Container Scan
 
-# Scans the image tar saved by docker-build.yaml. Findings go to the Security tab (SARIF);
-# monitor publishes a snapshot to Snyk; fail-on-issues turns on the quality gate.
+# Scans the image tar saved by docker-build.yaml. Findings go to the Security tab (SARIF) and the
+# run's summary page; monitor publishes a snapshot to Snyk and links it from the summary;
+# fail-on-issues turns on the quality gate (the job fails, so jobs that need it don't run).
 # Runs on pushes and manual runs only (not on pull requests).
 #
 # Caller job permissions: contents: read, actions: read, security-events: write.
@@ -67,17 +68,24 @@ jobs:
             --project-name=${{ inputs.project-name || github.repository }}
             --org=${{ inputs.snyk-org || github.repository_owner }}
             ${{ inputs.dockerfile && format('--file={0}', inputs.dockerfile) || '' }}
-        run: snyk container test $ARGS --severity-threshold=${{ inputs.severity-threshold }} --sarif-file-output=snyk-container.sarif
+        run: snyk container test $ARGS --severity-threshold=${{ inputs.severity-threshold }} --sarif-file-output=snyk-container.sarif --json-file-output=snyk-container.json
 
       - name: Snyk Container monitor
+        id: monitor
         if: inputs.monitor
+        continue-on-error: true
         env:
           ARGS: >-
             docker-archive:${{ runner.temp }}/image/${{ inputs.image-artifact }}.tar
             --project-name=${{ inputs.project-name || github.repository }}
             --org=${{ inputs.snyk-org || github.repository_owner }}
             ${{ inputs.dockerfile && format('--file={0}', inputs.dockerfile) || '' }}
-        run: snyk container monitor $ARGS --target-reference=${{ github.ref_name }}
+        run: |
+          rc=0
+          snyk container monitor $ARGS --target-reference=${{ github.ref_name }} > monitor.out 2>&1 || rc=$?
+          cat monitor.out
+          echo "url=$(grep -o 'https://app.snyk.io/org/[^ ]*' monitor.out | head -1)" >> "$GITHUB_OUTPUT"
+          exit $rc
 
       # GitHub rejects Snyk's SARIF when a fix text isn't a string; coerce it.
       - name: Fix SARIF for GitHub
@@ -92,6 +100,33 @@ jobs:
         with:
           sarif_file: snyk-container.sarif
           category: snyk-container
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        env:
+          OUTCOME: ${{ steps.test.outcome }}
+          THRESHOLD: ${{ inputs.severity-threshold }}
+          SNYK_URL: ${{ steps.monitor.outputs.url }}
+          SECURITY_TAB: ${{ github.server_url }}/${{ github.repository }}/security/code-scanning?query=is%3Aopen+tool%3A%22Snyk+Container%22+branch%3A${{ github.ref_name }}
+        run: |
+          {
+            if [[ "$OUTCOME" == "success" ]]; then echo "## ✅ Snyk Container scan passed"
+            else echo "## ❌ Snyk Container scan found issues at or above \`$THRESHOLD\`"; fi
+            echo
+            if [[ -f snyk-container.json ]]; then
+              jq -r '(if type == "array" then . else [.] end) as $p
+                | "Image: `\($p[0].path // "image")` · base image: `\($p[0].docker.baseImage // "unknown")`", "",
+                  "| Layer | Critical | High | Medium | Low |", "| --- | ---: | ---: | ---: | ---: |",
+                  ($p[] | ([.vulnerabilities[]? | {id, severity}] | unique) as $v
+                    | "| \(.targetFile // .displayTargetFile // "OS packages") | \([$v[] | select(.severity == "critical")] | length) | \([$v[] | select(.severity == "high")] | length) | \([$v[] | select(.severity == "medium")] | length) | \([$v[] | select(.severity == "low")] | length) |")' snyk-container.json
+            else
+              echo "The scan didn't produce results."
+            fi
+            echo
+            links="[GitHub Security tab]($SECURITY_TAB)"
+            [[ -n "$SNYK_URL" ]] && links="[View this run in Snyk]($SNYK_URL) · $links"
+            echo "$links"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Quality gate
         if: inputs.fail-on-issues && steps.test.outcome == 'failure'
