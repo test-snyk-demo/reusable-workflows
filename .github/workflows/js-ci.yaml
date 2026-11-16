@@ -1,14 +1,15 @@
 name: JavaScript CI
 
 # Reusable CI pipeline for JavaScript projects (npm or pnpm):
-#   build (a package.json script) + Snyk Open Source + Code -> Docker build -> Snyk Container
+#   build (a package.json script) + Snyk Open Source + Code -> Docker build -> Snyk Container -> push
 #
 # - build: false skips the build job (for apps with no build script).
 # - Snyk is report-only unless snyk-fail-on-issues is true, and needs a snyk-token (the SNYK_TOKEN
 #   secret). Results are published to Snyk (monitor) only on the default branch and
 #   hotfix/* branches, or always with snyk-force-monitor.
-# - The Docker steps run when docker-build is true. The image is pushed (GHCR by default) only on
-#   the default branch and hotfix/*, or with docker-force-push; dry-run never pushes.
+# - The Docker steps run when docker-build is true, on the default branch only. The image is pushed
+#   to GHCR only after the Snyk Container scan passes; dry-run never pushes.
+# - container-fail-on-issues makes high/critical image issues fail the scan, so the image isn't pushed.
 #
 # Caller job permissions: contents: read, actions: read, security-events: write,
 # pull-requests: write, packages: write.
@@ -81,6 +82,14 @@ on:
       snyk-force-monitor:
         type: boolean
         default: false
+      container-fail-on-issues:
+        type: boolean
+        default: false
+        description: Fail the container scan (and don't push) on issues at or above snyk-severity-threshold.
+      container-exclude-app-vulns:
+        type: boolean
+        default: false
+        description: Container scan checks the OS layer only; app dependencies are left to Snyk Open Source.
     secrets:
       snyk-token:
         required: false
@@ -89,11 +98,11 @@ on:
       build-artifact-name:
         value: ${{ jobs.build.outputs.artifact-name }}
       image-ref:
-        value: ${{ jobs.docker-build.outputs.image-ref }}
+        value: ${{ jobs.docker-push.outputs.image-ref }}
       image-tag:
         value: ${{ jobs.docker-build.outputs.build-tag }}
       image-digest:
-        value: ${{ jobs.docker-build.outputs.image-digest }}
+        value: ${{ jobs.docker-push.outputs.image-digest }}
 
 concurrency:
   group: js-ci-${{ github.workflow }}-${{ github.ref }}
@@ -166,7 +175,7 @@ jobs:
       image-name: ${{ inputs.docker-image-name }}
       context: ${{ inputs.docker-context }}
       dockerfile: ${{ inputs.docker-file }}
-      push: ${{ !inputs.dry-run && (inputs.docker-force-push || needs.setup.outputs.release-branch == 'true') }}
+      push: false
       export-image: true
 
   container-scan:
@@ -177,10 +186,46 @@ jobs:
     with:
       image-artifact: ${{ needs.docker-build.outputs.image-artifact }}
       dockerfile: ${{ inputs.docker-file || format('{0}/Dockerfile', inputs.docker-context) }}
-      fail-on-issues: ${{ inputs.snyk-fail-on-issues }}
+      fail-on-issues: ${{ inputs.container-fail-on-issues || inputs.snyk-fail-on-issues }}
+      exclude-app-vulns: ${{ inputs.container-exclude-app-vulns }}
       severity-threshold: ${{ inputs.snyk-severity-threshold }}
       project-name: ${{ inputs.snyk-project-name && format('{0}-container', inputs.snyk-project-name) || format('{0}-container', github.repository) }}
       snyk-org: ${{ inputs.snyk-org }}
       monitor: ${{ inputs.snyk-force-monitor || needs.setup.outputs.release-branch == 'true' }}
     secrets:
       snyk-token: ${{ secrets.snyk-token }}
+
+  docker-push:
+    name: Push image
+    needs: [setup, docker-build, container-scan]
+    if: ${{ !cancelled() && needs.container-scan.result == 'success' && !inputs.dry-run && (inputs.docker-force-push || needs.setup.outputs.release-branch == 'true') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-ref: ${{ needs.docker-build.outputs.image-ref }}
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.docker-build.outputs.image-artifact }}
+          path: ${{ runner.temp }}/image
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push the scanned image
+        id: push
+        env:
+          IMAGE_REF: ${{ needs.docker-build.outputs.image-ref }}
+          TAR: ${{ runner.temp }}/image/${{ needs.docker-build.outputs.image-artifact }}.tar
+        run: |
+          docker load -i "$TAR"
+          docker push "$IMAGE_REF"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$IMAGE_REF\` (\`$digest\`)" >> "$GITHUB_STEP_SUMMARY"

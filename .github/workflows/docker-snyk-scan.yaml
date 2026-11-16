@@ -23,6 +23,10 @@ on:
       severity-threshold:
         type: string
         default: high
+      exclude-app-vulns:
+        type: boolean
+        default: false
+        description: Scan the OS layer only (app dependencies are covered by Snyk Open Source).
       monitor:
         type: boolean
         default: false
@@ -69,6 +73,7 @@ jobs:
             --project-name=${{ inputs.project-name || github.repository }}
             --org=${{ inputs.snyk-org || github.repository_owner }}
             ${{ inputs.dockerfile && format('--file={0}', inputs.dockerfile) || '' }}
+            ${{ inputs.exclude-app-vulns && '--exclude-app-vulns' || '' }}
         run: snyk container test $ARGS --severity-threshold=${{ inputs.severity-threshold }} --sarif-file-output=snyk-container.sarif --json-file-output=snyk-container.json
 
       - name: Snyk Container monitor
@@ -81,6 +86,7 @@ jobs:
             --project-name=${{ inputs.project-name || github.repository }}
             --org=${{ inputs.snyk-org || github.repository_owner }}
             ${{ inputs.dockerfile && format('--file={0}', inputs.dockerfile) || '' }}
+            ${{ inputs.exclude-app-vulns && '--exclude-app-vulns' || '' }}
         run: |
           rc=0
           snyk container monitor $ARGS --target-reference=${{ github.ref_name }} > monitor.out 2>&1 || rc=$?
