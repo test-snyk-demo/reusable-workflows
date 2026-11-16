@@ -244,6 +244,16 @@ jobs:
           NOFIX: ${{ steps.plan.outputs.nofix }}
         run: |
           marker="<!-- snyk-autofix -->"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+          # Nothing new: stay quiet. Only an earlier Snyk Autofix comment is updated, so it isn't left stale.
+          if (( SCA_NEW == 0 )); then
+            echo "No new dependency issues: no comment." >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "$id" ]]; then
+              printf '%s\n%s\n' "$marker" "**Snyk Autofix:** ✅ resolved. This PR no longer introduces high/critical dependency issues." > ../comment.md
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@../comment.md >/dev/null
+            fi
+            exit 0
+          fi
           {
             echo "$marker"
             echo "## Snyk Autofix"
@@ -251,14 +261,12 @@ jobs:
             echo
             echo "**New Open Source (dependency) issues: $SCA_NEW**"
             if [[ -n "$URL" ]]; then echo "✅ Snyk's recommended upgrades are in **$URL** (new issues $SCA_NEW → $AFTER). Merge it into this branch."
-            elif (( SCA_NEW == 0 )); then echo "✅ No new dependency issues."
             else echo "No upgrade from Snyk could fix these automatically."; fi
             if [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do names+="\`${a%%|*}\` "; done; echo; echo "Major-version upgrades for you to review: $names"; fi
             if [[ -n "$NOFIX" ]]; then echo; echo "No fix available yet from Snyk: \`${NOFIX// /\`, \`}\`"; fi
             echo
             echo "_[Snyk Autofix run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
           } > ../comment.md
-          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
           if [[ -n "$id" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@../comment.md >/dev/null
           else gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@../comment.md >/dev/null; fi
           cat ../comment.md >> "$GITHUB_STEP_SUMMARY"
