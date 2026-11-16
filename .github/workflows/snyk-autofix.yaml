@@ -128,6 +128,7 @@ jobs:
         run: |
           current=$(grep -iE '^FROM ' "$DOCKERFILE" | tail -1 | awk '{print $2}')
           snyk container test "$current" --org="$SNYK_ORG" --file="$DOCKERFILE" --exclude-app-vulns > base.txt 2>&1 || true
+          sed -n '/^Testing /,/^Pro tip/p' base.txt | grep -vE '^\s*$' || cat base.txt
           read -r best ch < <(CUR="$current" node -e '
             const cur = process.env.CUR; let curn = null, best = null, bn = Infinity;
             for (const l of require("fs").readFileSync("base.txt", "utf8").split("\n")) {
