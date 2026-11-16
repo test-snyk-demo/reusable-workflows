@@ -6,13 +6,17 @@ name: Snyk Autofix
 # - npm: the upgrade Snyk recommends (upgradePath), applied with `npm install`.
 # - Go: the version Snyk says fixes it (fixedIn), applied with `go get module@version` + `go mod tidy`.
 #   Go standard library issues come from the Go version, not a module: they're listed for review.
-# Same-major upgrades are applied (up to 3 rounds: an upgrade can land on a version with its own newer
+# Same-major upgrades are applied (0.x: same minor, since 0.2 -> 0.3 is breaking; up to 3 rounds: an upgrade can land on a version with its own newer
 # issue); major upgrades are listed for review unless allow-major is set. It re-scans, opens a fix PR
 # against the PR's branch only when the count goes down, and posts the fix PR link on the PR (one
 # comment, updated in place; no comment when the PR introduces nothing). No AI: everything comes from
 # the Snyk CLI's output. Optionally (`dockerfile`) the base image Snyk Container recommends.
 #
-# Caller: on pull_request (e.g. a job after the Snyk scan), skipping branches that start with
+# mode: backlog fixes what's ALREADY on the branch it runs on (e.g. main, weekly or by hand): no baseline,
+# every upgradable high/critical issue counts, one fix PR into that branch (snyk-autofix/backlog-<branch>),
+# no PR comment. Caller: on schedule / workflow_dispatch on the default branch, with mode: backlog.
+#
+# Caller (mode: pr): on pull_request (e.g. a job after the Snyk scan), skipping branches that start with
 # snyk-autofix/ (the fix PRs). Caller job permissions: contents: write, pull-requests: write.
 # Secrets: snyk-token. app-token is optional: a PAT or GitHub App token (contents, pull requests and
 # issues: write). Without it, GITHUB_TOKEN is used, GitHub doesn't run CI on PRs it opens, and the repo
@@ -22,6 +26,10 @@ name: Snyk Autofix
 on:
   workflow_call:
     inputs:
+      mode:
+        type: string
+        default: pr
+        description: "pr: fix what a pull request introduces. backlog: fix what's already on the branch it runs on."
       node-version:
         type: string
         default: lts/*
@@ -58,7 +66,7 @@ permissions:
 
 jobs:
   autofix:
-    name: "Snyk Autofix for PR #${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}"
+    name: "${{ inputs.mode == 'backlog' && format('Snyk Autofix backlog for {0}', github.ref_name) || format('Snyk Autofix for PR #{0}', github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number) }}"
     runs-on: ubuntu-24.04
     env:
       SNYK_TOKEN: ${{ secrets.snyk-token }}
@@ -66,9 +74,10 @@ jobs:
       THRESHOLD: ${{ inputs.severity-threshold }}
       ALLOW_MAJOR: ${{ inputs.allow-major }}
       DOCKERFILE: ${{ inputs.dockerfile }}
-      PR_BRANCH: ${{ github.head_ref || github.event.workflow_run.head_branch }}
-      BASE_BRANCH: ${{ github.base_ref || github.event.workflow_run.pull_requests[0].base.ref }}
-      FIX_BRANCH: snyk-autofix/${{ github.head_ref || github.event.workflow_run.head_branch }}
+      MODE: ${{ inputs.mode }}
+      PR_BRANCH: ${{ inputs.mode == 'backlog' && github.ref_name || github.head_ref || github.event.workflow_run.head_branch }}
+      BASE_BRANCH: ${{ inputs.mode == 'backlog' && github.ref_name || github.base_ref || github.event.workflow_run.pull_requests[0].base.ref }}
+      FIX_BRANCH: ${{ inputs.mode == 'backlog' && format('snyk-autofix/backlog-{0}', github.ref_name) || format('snyk-autofix/{0}', github.head_ref || github.event.workflow_run.head_branch) }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.event.workflow_run.head_repository.full_name }}
       GH_TOKEN: ${{ secrets.app-token || github.token }}
@@ -78,6 +87,7 @@ jobs:
         working-directory: head
     steps:
       - name: Only for pull requests from this repo
+        if: inputs.mode != 'backlog'
         working-directory: .
         run: |
           if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" || -z "$PR_NUMBER" || -z "$BASE_BRANCH" ]]; then
@@ -88,11 +98,12 @@ jobs:
       - name: Check out the PR branch
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.head_ref || github.event.workflow_run.head_branch }}
+          ref: ${{ inputs.mode == 'backlog' && github.ref_name || github.head_ref || github.event.workflow_run.head_branch }}
           token: ${{ secrets.app-token || github.token }}
           path: head
 
       - name: Check out the base branch
+        if: inputs.mode != 'backlog'
         uses: actions/checkout@v7
         with:
           ref: ${{ github.base_ref || github.event.workflow_run.pull_requests[0].base.ref }}
@@ -143,7 +154,9 @@ jobs:
         env:
           STACK: ${{ steps.stack.outputs.stack }}
         run: |
-          for side in head base; do
+          # Backlog: no baseline, so every issue on the branch counts.
+          sides="head base"; [[ "$MODE" == backlog ]] && { sides=head; echo '{"vulnerabilities":[]}' > base-oss.json; }
+          for side in $sides; do
             ( cd "$side"
               snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > "../$side-oss.json" || true
               if [[ "$STACK" == "go" && "$side" == "head" ]]; then go list -m -f '{{.Path}} {{.Version}}' all > ../head-mods.txt || true; fi )
@@ -161,7 +174,8 @@ jobs:
           const strip = (s) => String(s || '').replace(/^v/, '');
           const cmp = (a, b) => { const x = strip(a).split(/[.+-]/).map(Number), y = strip(b).split(/[.+-]/).map(Number);
             for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); return 0; };
-          const major = (s) => strip(s).split('.')[0];
+          // Breaking-change boundary, as semver means it: the major, or for 0.x versions the minor (0.2 -> 0.3 breaks).
+          const major = (s) => { const p = strip(s).split('.'); return p[0] === '0' ? `0.${p[1]}` : p[0]; };
           const mode = process.argv[2];
 
           if (mode === 'count') {   // node snyk-delta.js count <head-oss.json> <base-oss.json>
@@ -321,9 +335,15 @@ jobs:
         run: |
           kind=$([[ "$STACK" == go ]] && echo Module || echo Package)
           {
-            echo "Applies **Snyk's recommendations** for the dependency issues that \`$PR_BRANCH\` (#$PR_NUMBER) introduces. Merge it into that branch."
-            echo
-            echo "**New high/critical Open Source issues in #$PR_NUMBER:** $BEFORE → $AFTER"
+            if [[ "$MODE" == backlog ]]; then
+              echo "Applies **Snyk's recommendations** for the dependency issues already on \`$PR_BRANCH\` (backlog). Review and merge."
+              echo
+              echo "**High/critical Open Source issues on $PR_BRANCH:** $BEFORE → $AFTER"
+            else
+              echo "Applies **Snyk's recommendations** for the dependency issues that \`$PR_BRANCH\` (#$PR_NUMBER) introduces. Merge it into that branch."
+              echo
+              echo "**New high/critical Open Source issues in #$PR_NUMBER:** $BEFORE → $AFTER"
+            fi
             if [[ -n "$APPLY" ]]; then
               echo; echo "| $kind | From | To | Snyk issues fixed |"; echo "|---|---|---|---|"
               for a in $APPLY; do IFS='|' read -r to from n <<< "$a"; echo "| \`${to%@*}\` | $from | ${to##*@} | $n |"; done
@@ -347,16 +367,35 @@ jobs:
           git switch -C "$FIX_BRANCH"
           files=($FILES); [[ -n "$DOCKERFILE" && -f "$DOCKERFILE" ]] && files+=("$DOCKERFILE")
           git add -- "${files[@]}"
-          git commit -qm "Snyk Autofix: Snyk's recommended upgrades for the issues $PR_BRANCH introduces"
+          git commit -qm "Snyk Autofix: Snyk's recommended upgrades for $([[ "$MODE" == backlog ]] && echo "the backlog on $PR_BRANCH" || echo "the issues $PR_BRANCH introduces")"
           git push -f origin "$FIX_BRANCH"
           url=$(gh pr list --head "$FIX_BRANCH" --base "$PR_BRANCH" --state open --json url -q '.[0].url')
           if [[ -n "$url" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/${url##*/}" -F body=@../body.md >/dev/null
-          else url=$(gh pr create --head "$FIX_BRANCH" --base "$PR_BRANCH" --title "Snyk Autofix for #$PR_NUMBER: new high/critical $BEFORE → $AFTER" --body-file ../body.md); fi
+          else
+            title="Snyk Autofix for #$PR_NUMBER: new high/critical $BEFORE → $AFTER"
+            [[ "$MODE" == backlog ]] && title="Snyk backlog fixes for $PR_BRANCH: high/critical $BEFORE → $AFTER"
+            url=$(gh pr create --head "$FIX_BRANCH" --base "$PR_BRANCH" --title "$title" --body-file ../body.md)
+          fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
       # One comment on the PR, updated in place: the fix PR link up front. No comment when nothing's new.
+      - name: Backlog summary
+        if: ${{ !cancelled() && inputs.mode == 'backlog' && steps.plan.outcome == 'success' }}
+        env:
+          URL: ${{ steps.pr.outputs.url }}
+          BEFORE: ${{ steps.plan.outputs.sca_new }}
+          AFTER: ${{ steps.verify.outputs.after }}
+          REVIEW: ${{ steps.apply.outputs.review || steps.plan.outputs.review }}
+        run: |
+          {
+            echo "## Snyk Autofix backlog for \`$PR_BRANCH\`"
+            echo "High/critical Open Source issues: **$BEFORE**${AFTER:+ → **$AFTER** after Snyk's upgrades}"
+            if [[ -n "$URL" ]]; then echo; echo "🔧 Fix PR: $URL"; else echo; echo "No upgrade from Snyk lowered the count: no PR."; fi
+            if [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do names+="\`${a%%|*}\` "; done; echo; echo "For review (not applied): $names"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Comment on the PR
-        if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
+        if: ${{ !cancelled() && inputs.mode != 'backlog' && steps.plan.outcome == 'success' }}
         env:
           URL: ${{ steps.pr.outputs.url }}
           SCA_NEW: ${{ steps.plan.outputs.sca_new }}
