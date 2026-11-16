@@ -1,18 +1,23 @@
 name: Snyk Autofix
 
-# Reusable, deterministic Snyk autofix for a pull request on an npm project. It compares the PR branch
-# with its base branch and acts only on what the PR introduces, at or above severity-threshold:
-# - Open Source (SCA): applies the upgrade Snyk recommends (upgradePath) for each new upgradable issue
-#   and opens a fix PR against the PR's branch. Major-version upgrades are listed for review instead,
-#   unless allow-major is set. Optionally (`dockerfile`) the base image Snyk Container recommends.
-# No AI involved: everything comes from the Snyk CLI's output.
+# Reusable, deterministic Snyk autofix for a pull request on an npm or Go project. It compares the PR
+# branch with its base branch and acts only on the Open Source (SCA) issues the PR introduces, at
+# high/critical (severity-threshold):
+# - npm: the upgrade Snyk recommends (upgradePath), applied with `npm install`.
+# - Go: the version Snyk says fixes it (fixedIn), applied with `go get module@version` + `go mod tidy`.
+#   Go standard library issues come from the Go version, not a module: they're listed for review.
+# Same-major upgrades are applied (up to 3 rounds: an upgrade can land on a version with its own newer
+# issue); major upgrades are listed for review unless allow-major is set. It re-scans, opens a fix PR
+# against the PR's branch only when the count goes down, and posts the fix PR link on the PR (one
+# comment, updated in place; no comment when the PR introduces nothing). No AI: everything comes from
+# the Snyk CLI's output. Optionally (`dockerfile`) the base image Snyk Container recommends.
 #
-# Caller: on workflow_run (CI completed) for pull requests, or on pull_request, skipping branches that
-# start with snyk-autofix/ (the fix PRs). A workflow_run caller only triggers once it's on the default branch.
-# Caller job permissions: contents: write, pull-requests: write.
-# Secrets: snyk-token. app-token is optional: a GitHub App token or PAT (contents + pull requests write).
-# Without it, GITHUB_TOKEN is used, GitHub doesn't run CI on PRs it opens, and the repo needs
-# "Allow GitHub Actions to create and approve pull requests".
+# Caller: on pull_request (e.g. a job after the Snyk scan), skipping branches that start with
+# snyk-autofix/ (the fix PRs). Caller job permissions: contents: write, pull-requests: write.
+# Secrets: snyk-token. app-token is optional: a PAT or GitHub App token (contents, pull requests and
+# issues: write). Without it, GITHUB_TOKEN is used, GitHub doesn't run CI on PRs it opens, and the repo
+# needs "Allow GitHub Actions to create and approve pull requests".
+# Go private modules: go-private-owners + go-modules-token, as in go-snyk.yaml.
 
 on:
   workflow_call:
@@ -20,6 +25,14 @@ on:
       node-version:
         type: string
         default: lts/*
+      go-version:
+        type: string
+        default: ""
+        description: Go version; empty reads go.mod.
+      go-private-owners:
+        type: string
+        default: ""
+        description: Comma-separated GitHub owners whose private Go modules the project needs.
       severity-threshold:
         type: string
         default: high
@@ -35,6 +48,8 @@ on:
       snyk-token:
         required: true
       app-token:
+        required: false
+      go-modules-token:
         required: false
 
 permissions:
@@ -57,6 +72,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.event.workflow_run.head_repository.full_name }}
       GH_TOKEN: ${{ secrets.app-token || github.token }}
+      GOTOOLCHAIN: auto   # a fix may need a newer Go; `go get` then raises the go line in go.mod
     defaults:
       run:
         working-directory: head
@@ -83,9 +99,38 @@ jobs:
           path: base
           persist-credentials: false
 
+      - name: Detect the stack
+        id: stack
+        run: |
+          if [[ -f go.mod ]]; then echo "stack=go" >> "$GITHUB_OUTPUT"; echo "files=go.mod go.sum" >> "$GITHUB_OUTPUT"
+          elif [[ -f package-lock.json ]]; then echo "stack=npm" >> "$GITHUB_OUTPUT"; echo "files=package.json package-lock.json" >> "$GITHUB_OUTPUT"
+          else echo "::error title=Snyk Autofix::No go.mod or package-lock.json at the repo root: only npm and Go are supported."; exit 1; fi
+
+      # Node runs the comparison script for both stacks.
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ inputs.node-version }}
+
+      - name: Configure private Go modules
+        if: steps.stack.outputs.stack == 'go' && inputs.go-private-owners != ''
+        env:
+          OWNERS: ${{ inputs.go-private-owners }}
+          TOKEN: ${{ secrets.go-modules-token }}
+        run: |
+          goprivate=$(tr ', ' '\n\n' <<<"$OWNERS" | sed '/^$/d; s#^#github.com/#; s#$#/*#' | paste -sd, -)
+          echo "GOPRIVATE=$goprivate" >> "$GITHUB_ENV"
+          if [[ -z "$TOKEN" ]]; then
+            echo "::warning title=No token for private modules::Set the go-modules-token secret. Only public modules will resolve."
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - uses: actions/setup-go@v7
+        if: steps.stack.outputs.stack == 'go'
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && 'head/go.mod' || '' }}
+          cache: false
 
       - uses: jdx/mise-action@v5
         with:
@@ -95,9 +140,13 @@ jobs:
 
       - name: Snyk Open Source test, PR branch and base branch
         working-directory: .
+        env:
+          STACK: ${{ steps.stack.outputs.stack }}
         run: |
           for side in head base; do
-            ( cd "$side" && snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > "../$side-oss.json" || true )
+            ( cd "$side"
+              snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > "../$side-oss.json" || true
+              if [[ "$STACK" == "go" && "$side" == "head" ]]; then go list -m -f '{{.Path}} {{.Version}}' all > ../head-mods.txt || true; fi )
           done
           cat > "$RUNNER_TEMP/snyk-delta.js" <<'EOF'
           // Compares Snyk results of the PR branch (head) with its base branch: only what the PR introduces.
@@ -109,27 +158,54 @@ jobs:
             const old = new Set((base.vulnerabilities || []).map(vulnKey));
             return (head.vulnerabilities || []).filter((v) => SEV.has(v.severity) && !old.has(vulnKey(v)));
           };
+          const strip = (s) => String(s || '').replace(/^v/, '');
+          const cmp = (a, b) => { const x = strip(a).split(/[.+-]/).map(Number), y = strip(b).split(/[.+-]/).map(Number);
+            for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); return 0; };
+          const major = (s) => strip(s).split('.')[0];
           const mode = process.argv[2];
 
           if (mode === 'count') {   // node snyk-delta.js count <head-oss.json> <base-oss.json>
             console.log(new Set(newVulns(read(process.argv[3], {}), read(process.argv[4], {})).map(vulnKey)).size);
           }
 
-          if (mode === 'plan') {    // writes GITHUB_OUTPUT lines
+          if (mode === 'plan') {    // prints apply=, review=, nofix=, sca_new= (GITHUB_OUTPUT lines)
             const allowMajor = process.env.ALLOW_MAJOR === 'true';
-            const at = (s) => { const i = s.lastIndexOf('@'); return [s.slice(0, i), s.slice(i + 1)]; };
-            const cmp = (a, b) => { const x = a.split(/[.-]/).map(Number), y = b.split(/[.-]/).map(Number);
-              for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); return 0; };
-            const sca = newVulns(read('head-oss.json', {}), read('base-oss.json', {}));
-            // Per package: the highest same-major upgrade is applied; a major upgrade is listed for review.
+            const head = read('head-oss.json', {});
+            const sca = newVulns(head, read('base-oss.json', {}));
             const pkgs = {}, noFix = new Set();
-            for (const v of sca) {
-              if (!v.isUpgradable || !v.upgradePath?.[1]) { noFix.add(`${v.packageName}@${v.version}`); continue; }
-              const [name, ver] = at(v.upgradePath[1]);
-              const p = (pkgs[name] ??= { cur: at(v.from[1])[1], minor: null, major: null, nMinor: new Set(), nMajor: new Set() });
-              const kind = !allowMajor && ver.split('.')[0] !== p.cur.split('.')[0] ? 'major' : 'minor';
+            // One target per package/module: the highest same-major fix is applied, a major one goes to review.
+            const add = (name, cur, ver, id) => {
+              const p = (pkgs[name] ??= { cur, minor: null, major: null, nMinor: new Set(), nMajor: new Set() });
+              const kind = !allowMajor && major(ver) !== major(p.cur) ? 'major' : 'minor';
               if (!p[kind] || cmp(ver, p[kind]) > 0) p[kind] = ver;
-              p[kind === 'major' ? 'nMajor' : 'nMinor'].add(v.id);
+              p[kind === 'major' ? 'nMajor' : 'nMinor'].add(id);
+            };
+            if (head.packageManager === 'gomodules') {
+              // Snyk reports Go packages; `go get` needs their module. Longest module path that prefixes the package.
+              let mods = [];
+              try { mods = fs.readFileSync('head-mods.txt', 'utf8').trim().split('\n').map((l) => l.split(' ')); } catch {}
+              for (const v of sca) {
+                const pkg = v.moduleName || v.packageName;
+                // The smallest fixed version above the current one (fixedIn lists one per release line).
+                const fix = (v.fixedIn || []).filter((f) => cmp(f, v.version) > 0).sort(cmp)[0];
+                if (pkg.startsWith('std/')) { // standard library: fixed by a newer Go, not by go get
+                  if (fix) add('go', strip(v.version), strip(fix), v.id); else noFix.add(`go@${v.version}`);
+                  continue;
+                }
+                const mod = mods.filter(([m]) => pkg === m || pkg.startsWith(m + '/')).sort((a, b) => b[0].length - a[0].length)[0];
+                if (!mod || !fix) { noFix.add(`${pkg}@${v.version}`); continue; }
+                add(mod[0], strip(mod[1]), strip(fix), v.id);
+              }
+              // The Go toolchain is never upgraded here: always a review item.
+              if (pkgs.go) { pkgs.go.major = [pkgs.go.minor, pkgs.go.major].filter(Boolean).sort(cmp).pop();
+                pkgs.go.nMajor = new Set([...pkgs.go.nMinor, ...pkgs.go.nMajor]); pkgs.go.minor = null; }
+            } else {
+              const at = (s) => { const i = s.lastIndexOf('@'); return [s.slice(0, i), s.slice(i + 1)]; };
+              for (const v of sca) {
+                if (!v.isUpgradable || !v.upgradePath?.[1]) { noFix.add(`${v.packageName}@${v.version}`); continue; }
+                const [name, ver] = at(v.upgradePath[1]);
+                add(name, at(v.from[1])[1], ver, v.id);
+              }
             }
             const apply = [], review = [];
             for (const [name, p] of Object.entries(pkgs)) {
@@ -155,8 +231,11 @@ jobs:
       - name: Apply dependency upgrades
         id: apply
         if: steps.plan.outputs.apply != ''
+        env:
+          STACK: ${{ steps.stack.outputs.stack }}
         run: |
           declare -A from count; order=(); prev=""
+          go_before=$( [[ "$STACK" == go ]] && awk '/^go /{print $2}' go.mod || true )
           for round in 1 2 3; do
             plan=$(cd .. && node "$RUNNER_TEMP/snyk-delta.js" plan)
             apply=$(sed -n 's/^apply=//p' <<< "$plan")
@@ -164,21 +243,30 @@ jobs:
             [[ -z "$apply" || "$apply" == "$prev" ]] && break
             prev="$apply"; pkgs=()
             for a in $apply; do
-              IFS='|' read -r to cur n <<< "$a"; name="${to%@*}"; pkgs+=("$to")
+              IFS='|' read -r to cur n <<< "$a"; name="${to%@*}"
               [[ -z "${from[$name]:-}" ]] && { from[$name]="$cur"; order+=("$name"); }
               count[$name]=$(( ${count[$name]:-0} + n ))
+              if [[ "$STACK" == go ]]; then pkgs+=("$name@v${to##*@}"); else pkgs+=("$to"); fi
             done
             echo "::group::Round $round: ${pkgs[*]}"
-            npm install --ignore-scripts --no-audit --no-fund "${pkgs[@]}"
+            if [[ "$STACK" == go ]]; then
+              go get "${pkgs[@]}" && go mod tidy
+            else
+              npm install --ignore-scripts --no-audit --no-fund "${pkgs[@]}"
+            fi
             echo "::endgroup::"
             snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > ../head-oss.json || true
+            if [[ "$STACK" == go ]]; then go list -m -f '{{.Path}} {{.Version}}' all > ../head-mods.txt; fi
           done
           applied=""
           for name in "${order[@]}"; do
-            to=$(node -p "require('./package-lock.json').packages['node_modules/$name'].version")
+            if [[ "$STACK" == go ]]; then to=$(go list -m -f '{{.Version}}' "$name"); to="${to#v}"
+            else to=$(node -p "require('./package-lock.json').packages['node_modules/$name'].version"); fi
             applied+="$name@$to|${from[$name]}|${count[$name]} "
           done
-          { echo "applied=${applied% }"; echo "review=$review"; echo "nofix=$nofix"; } | tee -a "$GITHUB_OUTPUT"
+          go_after=$( [[ "$STACK" == go ]] && awk '/^go /{print $2}' go.mod || true )
+          { echo "applied=${applied% }"; echo "review=$review"; echo "nofix=$nofix"
+            if [[ -n "$go_before" && "$go_before" != "$go_after" ]]; then echo "go_bump=$go_before → $go_after"; fi; } | tee -a "$GITHUB_OUTPUT"
 
       - name: Snyk Container base image recommendation
         id: base
@@ -206,11 +294,12 @@ jobs:
         if: steps.plan.outputs.apply != '' || steps.base.outputs.image != ''
         env:
           BEFORE: ${{ steps.plan.outputs.sca_new }}
+          FILES: ${{ steps.stack.outputs.files }}
         run: |
           snyk test --org="$SNYK_ORG" --severity-threshold="$THRESHOLD" --json > ../after-oss.json || true
           after=$(node "$RUNNER_TEMP/snyk-delta.js" count ../after-oss.json ../base-oss.json)
           echo "after=$after" >> "$GITHUB_OUTPUT"
-          changed=$(git status --porcelain -- package.json package-lock.json | wc -l)
+          changed=$(git status --porcelain -- $FILES | wc -l)
           if { (( changed > 0 )) && (( after < BEFORE )); } || [[ -n "${{ steps.base.outputs.image }}" ]]; then
             echo "open=true" >> "$GITHUB_OUTPUT"
           fi
@@ -219,36 +308,45 @@ jobs:
         id: pr
         if: steps.verify.outputs.open == 'true'
         env:
+          STACK: ${{ steps.stack.outputs.stack }}
+          FILES: ${{ steps.stack.outputs.files }}
           APPLY: ${{ steps.apply.outputs.applied }}
           REVIEW: ${{ steps.apply.outputs.review }}
+          GO_BUMP: ${{ steps.apply.outputs.go_bump }}
           BEFORE: ${{ steps.plan.outputs.sca_new }}
           AFTER: ${{ steps.verify.outputs.after }}
           BASE_FROM: ${{ steps.base.outputs.current }}
           BASE_TO: ${{ steps.base.outputs.image }}
           BASE_CHANGE: ${{ steps.base.outputs.change }}
         run: |
+          kind=$([[ "$STACK" == go ]] && echo Module || echo Package)
           {
             echo "Applies **Snyk's recommendations** for the dependency issues that \`$PR_BRANCH\` (#$PR_NUMBER) introduces. Merge it into that branch."
             echo
             echo "**New high/critical Open Source issues in #$PR_NUMBER:** $BEFORE → $AFTER"
             if [[ -n "$APPLY" ]]; then
-              echo; echo "| Package | From | To | Snyk issues fixed |"; echo "|---|---|---|---|"
+              echo; echo "| $kind | From | To | Snyk issues fixed |"; echo "|---|---|---|---|"
               for a in $APPLY; do IFS='|' read -r to from n <<< "$a"; echo "| \`${to%@*}\` | $from | ${to##*@} | $n |"; done
+            fi
+            if [[ -n "$GO_BUMP" ]]; then
+              echo; echo "**Go version:** the fix needs a newer Go, so \`go.mod\` now says \`go ${GO_BUMP##*→ }\` (was \`${GO_BUMP%% →*}\`). CI that reads go.mod follows it."
             fi
             if [[ -n "$BASE_TO" ]]; then
               echo; echo "**Container base image** (\`$DOCKERFILE\`): \`$BASE_FROM\` → \`$BASE_TO\`, critical + high $BASE_CHANGE"
             fi
             if [[ -n "$REVIEW" ]]; then
-              echo; echo "**Needs review (major version, not applied):**"
-              for a in $REVIEW; do IFS='|' read -r to from n <<< "$a"; echo "- \`${to%@*}\` $from → ${to##*@} ($n issues)"; done
+              echo; echo "**Needs review (not applied):**"
+              for a in $REVIEW; do IFS='|' read -r to from n <<< "$a"
+                if [[ "${to%@*}" == go ]]; then echo "- Go toolchain $from → ${to##*@} (standard library, $n issues)"
+                else echo "- \`${to%@*}\` $from → ${to##*@}, major version ($n issues)"; fi; done
             fi
             echo; echo "_Generated by Snyk Autofix from \`snyk test\`: [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
           } > ../body.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$FIX_BRANCH"
-          files=(package.json package-lock.json); [[ -n "$DOCKERFILE" && -f "$DOCKERFILE" ]] && files+=("$DOCKERFILE")
-          git add "${files[@]}"
+          files=($FILES); [[ -n "$DOCKERFILE" && -f "$DOCKERFILE" ]] && files+=("$DOCKERFILE")
+          git add -- "${files[@]}"
           git commit -qm "Snyk Autofix: Snyk's recommended upgrades for the issues $PR_BRANCH introduces"
           git push -f origin "$FIX_BRANCH"
           url=$(gh pr list --head "$FIX_BRANCH" --base "$PR_BRANCH" --state open --json url -q '.[0].url')
@@ -256,6 +354,7 @@ jobs:
           else url=$(gh pr create --head "$FIX_BRANCH" --base "$PR_BRANCH" --title "Snyk Autofix for #$PR_NUMBER: new high/critical $BEFORE → $AFTER" --body-file ../body.md); fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
 
+      # One comment on the PR, updated in place: the fix PR link up front. No comment when nothing's new.
       - name: Comment on the PR
         if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
         env:
@@ -284,15 +383,16 @@ jobs:
           {
             echo "$marker"
             echo "## Snyk Autofix"
-            echo "_What this PR introduces compared with \`$BASE_BRANCH\`, at \`$THRESHOLD\` and above._"
-            echo
-            echo "**New Open Source (dependency) issues: $SCA_NEW**"
-            if [[ -n "$URL" ]]; then echo "✅ Snyk's recommended upgrades are in **$URL** (new issues $SCA_NEW → $AFTER). Merge it into this branch."
-            else echo "No upgrade from Snyk could fix these automatically."; fi
-            if [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do names+="\`${a%%|*}\` "; done; echo; echo "Major-version upgrades for you to review: $names"; fi
+            if [[ -n "$URL" ]]; then
+              echo "### 🔧 Fix PR: $URL"
+              echo "Snyk's recommended upgrades for the dependency issues this PR introduces: **$SCA_NEW → $AFTER** new high/critical. Merge the fix PR into this branch."
+            else
+              echo "**$SCA_NEW** new high/critical dependency issues. No upgrade from Snyk could fix them automatically."
+            fi
+            if [[ -n "$REVIEW" ]]; then names=""; for a in $REVIEW; do n="${a%%|*}"; [[ "${n%@*}" == go ]] && n="Go toolchain ${n##*@}"; names+="\`$n\` "; done; echo; echo "For you to review (not applied): $names"; fi
             if [[ -n "$NOFIX" ]]; then echo; echo "No fix available yet from Snyk: \`${NOFIX// /\`, \`}\`"; fi
             echo
-            echo "_[Snyk Autofix run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
+            echo "_Compared with \`$BASE_BRANCH\`, at \`$THRESHOLD\` and above · [Snyk Autofix run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)_"
           } > ../comment.md
           if [[ -n "$id" ]]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@../comment.md >/dev/null
           else gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@../comment.md >/dev/null; fi
